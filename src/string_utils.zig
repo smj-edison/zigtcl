@@ -32,8 +32,8 @@ pub fn ascii_compare(codepoint_slice: ?[]const u8, char: u8) bool {
 ///
 /// The pattern is matched against unicode char 'c'.
 ///
-/// If (flags & JIM_NOCASE), case is ignored when matching.
-/// If (flags & JIM_CHARSET_SCAN), the considers ^ and ] special at the start
+/// If StringFlags.case_insensitive, case is ignored when matching.
+/// If StringFlags.charset_scan, the considers ^ and ] special at the start
 /// of the charset, per scan, rather than glob/string match.
 ///
 /// If the unicode char 'c' matches that set, returns a pointer to the ']' character,

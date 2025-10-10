@@ -7,6 +7,6 @@
             .hash = "uucode-0.1.0-ZZjBPvoGQACkgWDKIrtI8CQcSXIufU3Kvty-pIfh02i2",
         },
     },
-    .fingerprint = 0x1cef62e6d82bb3df,
+    .fingerprint = 0x708480192236e607,
     .paths = .{""},
 }

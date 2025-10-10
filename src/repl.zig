@@ -1,6 +1,6 @@
 const std = @import("std");
 //const uucode = @import("uucode");
-const jim = @import("jim.c");
+const zigtcl = @import("zigtcl.c");
 
 pub fn main() void {
     var cp: u21 = undefined;
