@@ -3,8 +3,8 @@
     .version = "0.1.0",
     .dependencies = .{
         .uucode = .{
-            .url = "https://github.com/jacobsandlund/uucode/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "uucode-0.1.0-ZZjBPvoGQACkgWDKIrtI8CQcSXIufU3Kvty-pIfh02i2",
+            .url = "https://github.com/jacobsandlund/uucode/archive/49138bfcc3d40982f22cb950fee29707c3672f87.tar.gz",
+            .hash = "uucode-0.1.0-ZZjBPkl4QADrhxZQyGOogzo8jzwEdSkD35mIxW3Gcj0I",
         },
     },
     .fingerprint = 0x708480192236e607,
