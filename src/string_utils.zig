@@ -1,5 +1,6 @@
 const std = @import("std");
 const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
 const use_utf8 = @import("options").use_utf8;
 
 const StringFlags = packed struct(u32) {
@@ -78,12 +79,17 @@ const Uppercase = if (use_utf8) struct {
     }
 };
 
-const StringIterator = blk: {
+test Uppercase {
+    const cp = 0x00DF;
+    const res = Uppercase.from(cp, true);
+    std.debug.print("Uppercase: {}", .{res.value});
+}
+
+const Iterator = blk: {
     if (use_utf8) {
         const uucode = @import("uucode");
         break :blk uucode.utf8.Iterator;
     } else {
-        // dummy iterator for ASCII
         break :blk struct {
             bytes: []const u8,
             i: usize = 0,
@@ -113,6 +119,70 @@ const StringIterator = blk: {
     }
 };
 
+pub fn compare(a: []const u8, b: []const u8) std.math.Order {
+    var a_iter = Iterator.init(a);
+    var b_iter = Iterator.init(b);
+
+    while (true) {
+        const a_cp = a_iter.next();
+        const b_cp = b_iter.next();
+
+        if (a_cp != null and b_cp != null) {
+            const order = std.math.order(u21, a_cp.?, b_cp.?);
+            if (order != .eq) return order;
+        } else {
+            if (a_cp == null and b_cp != null) return .lt;
+            if (a_cp == null and b_cp == null) return .eq;
+            if (a_cp != null and b_cp == null) return .gt;
+        }
+    }
+
+    return .eq;
+}
+
+const cpIndex = (if (use_utf8) struct {
+    pub fn cpIndex(str: []const u8, index: usize) ?usize {
+        if (index >= str.len) return null;
+
+        var iter = Iterator.init(str);
+
+        var cp_index: usize = 0;
+        while (cp_index < index) {
+            _ = iter.next() orelse return null;
+            cp_index += 1;
+        }
+
+        return iter.i;
+    }
+} else struct {
+    pub fn cpIndex(str: []const u8, index: usize) ?usize {
+        if (index >= str.length) return null;
+        return index;
+    }
+}).cpIndex;
+
+const strlen = (if (use_utf8) struct {
+    pub fn strlen(str: []const u8) usize {
+        var iter = Iterator.init(str);
+        var count = 0;
+
+        while (iter.next()) {
+            count += 1;
+        }
+
+        return count;
+    }
+} else struct {
+    pub fn strlen(str: []const u8) usize {
+        return str.len;
+    }
+}).strlen;
+
+test "codepoint index" {
+    try expectEqual(cpIndex("hello", 3), 3);
+    try expectEqual(cpIndex("⇧hello", 3), 5);
+}
+
 /// pattern points to a string like "[^a-z\ub5]"
 ///
 /// The pattern may contain trailing chars, which are ignored.
@@ -132,7 +202,7 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
     var inverted = false;
     var found_match = false;
 
-    var pattern_iter = StringIterator.init(pattern);
+    var pattern_iter = Iterator.init(pattern);
 
     const to_check = Uppercase.from(cp, flags.case_insensitive);
 
@@ -212,9 +282,9 @@ test "charsetMatch" {
 /// Glob-style pattern matching.
 ///
 /// Note: string *must* be valid UTF-8 sequences.
-pub fn glob_match(pattern: []const u8, string: []const u8, case_insensitive: bool) bool {
-    var pattern_iter = StringIterator.init(pattern);
-    var string_iter = StringIterator.init(string);
+pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) bool {
+    var pattern_iter = Iterator.init(pattern);
+    var string_iter = Iterator.init(str);
 
     while (pattern_iter.next()) |pattern_cp| {
         switch (pattern_cp) {
@@ -229,9 +299,9 @@ pub fn glob_match(pattern: []const u8, string: []const u8, case_insensitive: boo
                     return true;
                 }
 
-                while (string_iter.i < string.len) {
+                while (string_iter.i < str.len) {
                     // Recursive call - Does the remaining pattern match anywhere?
-                    if (glob_match(pattern[pattern_iter.i..], string[string_iter.i..], case_insensitive)) {
+                    if (globMatch(pattern[pattern_iter.i..], str[string_iter.i..], case_insensitive)) {
                         return true; // match
                     }
                     _ = string_iter.next(); // advance iterator
@@ -276,7 +346,7 @@ pub fn glob_match(pattern: []const u8, string: []const u8, case_insensitive: boo
             },
         }
 
-        if (string_iter.i >= string.len) {
+        if (string_iter.i >= str.len) {
             // keep advancing until it's not an asterisk
             while (pattern_iter.peek() == '*') {
                 _ = pattern_iter.next();
@@ -285,9 +355,62 @@ pub fn glob_match(pattern: []const u8, string: []const u8, case_insensitive: boo
     }
 
     // did we reach the end of both?
-    return (string_iter.i >= string.len) and (pattern_iter.i >= pattern.len);
+    return (string_iter.i >= str.len) and (pattern_iter.i >= pattern.len);
 }
 
 test "glob match" {
-    try expect(glob_match("any?hing", "ANYTHING", true));
+    try expect(globMatch("any?hing", "ANYTHING", true));
+    try expect(!globMatch("any?hing", "ANYTHING", false));
+}
+
+pub fn findFirstOccurrence(searching_for: []const u8, searching_in: []const u8, cp_index: usize) ?usize {
+    if (searching_for.len > searching_in.len or cp_index > searching_in.len) {
+        return null;
+    }
+
+    var searching_in_iter = Iterator.init(searching_in);
+    searching_in_iter.i = cpIndex(searching_in, cp_index) orelse return null;
+
+    while (true) : (_ = searching_in_iter.next()) {
+        _ = searching_in_iter.peek() orelse return null;
+        if (searching_in_iter.bytes.len - searching_in_iter.i < searching_for.len) {
+            return null;
+        }
+
+        const searching_in_slice =
+            searching_in[searching_in_iter.i .. searching_in_iter.i + searching_for.len];
+        if (std.mem.eql(u8, searching_for, searching_in_slice)) {
+            return searching_in_iter.i;
+        }
+    }
+
+    return null;
+}
+
+test "Find first occurrence" {
+    try expectEqual(findFirstOccurrence("world", "hello world world", 0), 6);
+    try expectEqual(findFirstOccurrence("wold", "hello world", 0), null);
+    try expectEqual(findFirstOccurrence("world", "hello world", 6), 6);
+    try expectEqual(findFirstOccurrence("world", "hello world", 7), null);
+}
+
+pub fn findLastOccurrence(searching_for: []const u8, searching_in: []const u8) ?usize {
+    if (searching_for.len > searching_in.len) {
+        return null;
+    }
+
+    var idx = searching_in.len - searching_for.len;
+    while (true) {
+        if (std.mem.eql(u8, searching_for, searching_in[idx .. idx + searching_for.len])) {
+            return idx;
+        }
+
+        if (idx == 0) return null;
+        idx -= 1;
+    }
+}
+
+test "Find last occurrence" {
+    try expectEqual(findLastOccurrence("world", "hello world world"), 12);
+    try expectEqual(findLastOccurrence("world", "hello"), null);
 }
