@@ -86,7 +86,6 @@ const Tokenizer = struct {
 
         var brace_depth: u32 = undefined; // curly bracket depth
         var bracket_depth: u32 = undefined;
-        var paren_depth: u32 = undefined; // used with dict sugar
 
         var tag: Token.Tag = undefined;
         var start = self.index;

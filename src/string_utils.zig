@@ -126,21 +126,6 @@ pub fn strlenAscii(str: []const u8) usize {
 /// get the string length in codepoints
 const strlen = if (use_utf8) strlenUtf8 else strlenAscii;
 
-pub fn isWhitespaceUtf8(cp: u21) bool {
-    return uucode.get(.general_category, cp) == .separator_space;
-}
-
-pub const isWhitespace = if (use_utf8) isWhitespaceUtf8 else std.ascii.isWhitespace;
-
-test "Is whitespace" {
-    try expect(isWhitespace(" "));
-    try expect(!isWhitespace("a"));
-
-    if (use_utf8) {
-        try expect(!isWhitespace("a"));
-    }
-}
-
 /// pattern points to a string like "[^a-z\ub5]"
 ///
 /// The pattern may contain trailing chars, which are ignored.
