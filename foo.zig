@@ -1,20 +1,12 @@
 const std = @import("std");
 
 pub fn main() !void {
-    var x: u32 = 0;
-    while (x < 10) {
-        std.debug.print("x: {}\n", .{x});
-        x += 1;
-
-        const char = '(';
-
-        switch (char) {
-            '(' => {
-                std.debug.print("first", .{});
-            },
-            '(', ')' => {
-                std.debug.print("second", .{});
-            },
+    const result: ?u32 = blk: {
+        while (@rem(std.time.nanoTimestamp(), 2) == 0) {
+            break :blk @as(u32, 10);
         }
-    }
+        break :blk null;
+    };
+
+    std.debug.print("Value: {?}", .{result});
 }
