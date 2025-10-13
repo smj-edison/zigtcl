@@ -1,6 +1,9 @@
 const std = @import("std");
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+
+const uucode = @import("uucode");
+
 const use_utf8 = @import("options").use_utf8;
 
 const StringFlags = packed struct(u32) {
@@ -10,115 +13,53 @@ const StringFlags = packed struct(u32) {
 };
 
 const Codepoint = if (use_utf8) u21 else u8;
-const Uppercase = if (use_utf8) struct {
-    const uucode = @import("uucode");
-    const Self = @This();
 
-    const Value = union(enum) { cp: u21, cp_slice: []const u21 };
-    value: Value,
-
-    pub fn from(cp: u21, enabled: bool) Self {
-        if (enabled) {
-            var buffer: [1]u21 = undefined;
-            const uppercase = uucode.get(.uppercase_mapping, cp).with(&buffer, cp);
-
-            if (uppercase[0..1] == &buffer) {
-                // using buffer as backing
-                return .{
-                    .value = .{ .cp = uppercase[0] },
-                };
-            } else {
-                return .{
-                    .value = .{ .cp_slice = uppercase },
-                };
-            }
-        }
-
-        return .{ .value = Value{ .cp = cp } };
-    }
-
-    pub fn cmp(self: Self, other: Self) std.math.Order {
-        switch (self.value) {
-            .cp => |self_cp| {
-                switch (other.value) {
-                    .cp => |other_cp| {
-                        return std.math.order(self_cp, other_cp);
-                    },
-                    .cp_slice => |other_slice| {
-                        return std.mem.order(u21, &.{self_cp}, other_slice);
-                    },
-                }
-            },
-            .cp_slice => |self_slice| {
-                switch (other.value) {
-                    .cp => |other_cp| {
-                        return std.mem.order(u21, self_slice, &.{other_cp});
-                    },
-                    .cp_slice => |other_slice| {
-                        return std.mem.order(u21, self_slice, other_slice);
-                    },
-                }
-            },
-        }
-    }
-} else struct {
-    const Self = @This();
-
-    value: u8,
-
-    pub fn from(cp: u8, enabled: bool) Self {
-        if (enabled and cp >= 'a' and cp <= 'z') {
-            return .{ .value = cp & 0x5f };
-        }
-
-        return .{ .value = cp };
-    }
-
-    pub fn cmp(self: Self, other: Self) std.math.Order {
-        return std.math.order(self.value, other.value);
-    }
-};
-
-test Uppercase {
-    const cp = 0x00DF;
-    const res = Uppercase.from(cp, true);
-    std.debug.print("Uppercase: {}", .{res.value});
+fn toUppercaseUtf8(cp: u21) u21 {
+    return uucode.get(.simple_uppercase_mapping, cp);
 }
 
-const Iterator = blk: {
-    if (use_utf8) {
-        const uucode = @import("uucode");
-        break :blk uucode.utf8.Iterator;
+const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
+
+/// Conditional uppercase
+fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
+    if (enabled) {
+        return toUpper(cp);
     } else {
-        break :blk struct {
-            bytes: []const u8,
-            i: usize = 0,
+        return cp;
+    }
+}
 
-            const Self = @This();
+const AsciiIterator = struct {
+    bytes: []const u8,
+    i: usize = 0,
 
-            pub fn init(bytes: []const u8) Self {
-                return .{
-                    .bytes = bytes,
-                };
-            }
+    const Self = @This();
 
-            pub fn next(self: *Self) ?u8 {
-                if (self.i >= self.bytes.len) return null;
-
-                const cp = self.bytes[self.i];
-                self.i += 1;
-
-                return cp;
-            }
-
-            pub fn peek(self: Self) ?u8 {
-                var it = self;
-                return it.next();
-            }
+    pub fn init(bytes: []const u8) Self {
+        return .{
+            .bytes = bytes,
         };
+    }
+
+    pub fn next(self: *Self) ?u8 {
+        if (self.i >= self.bytes.len) return null;
+
+        const cp = self.bytes[self.i];
+        self.i += 1;
+
+        return cp;
+    }
+
+    pub fn peek(self: Self) ?u8 {
+        var it = self;
+        return it.next();
     }
 };
 
+/// Iterate over codepoints
+pub const Iterator = if (use_utf8) uucode.utf8.Iterator else AsciiIterator;
+
+/// lexographical comparision of codepoints
 pub fn compare(a: []const u8, b: []const u8) std.math.Order {
     var a_iter = Iterator.init(a);
     var b_iter = Iterator.init(b);
@@ -140,47 +81,64 @@ pub fn compare(a: []const u8, b: []const u8) std.math.Order {
     return .eq;
 }
 
-const cpIndex = (if (use_utf8) struct {
-    pub fn cpIndex(str: []const u8, index: usize) ?usize {
-        if (index >= str.len) return null;
+pub fn cpIndexUtf8(str: []const u8, index: usize) ?usize {
+    if (index >= str.len) return null;
 
-        var iter = Iterator.init(str);
+    var iter = Iterator.init(str);
 
-        var cp_index: usize = 0;
-        while (cp_index < index) {
-            _ = iter.next() orelse return null;
-            cp_index += 1;
-        }
-
-        return iter.i;
+    var cp_index: usize = 0;
+    while (cp_index < index) {
+        _ = iter.next() orelse return null;
+        cp_index += 1;
     }
-} else struct {
-    pub fn cpIndex(str: []const u8, index: usize) ?usize {
-        if (index >= str.length) return null;
-        return index;
-    }
-}).cpIndex;
 
-const strlen = (if (use_utf8) struct {
-    pub fn strlen(str: []const u8) usize {
-        var iter = Iterator.init(str);
-        var count = 0;
+    return iter.i;
+}
 
-        while (iter.next()) {
-            count += 1;
-        }
+pub fn cpIndexAscii(str: []const u8, index: usize) ?usize {
+    if (index >= str.length) return null;
+    return index;
+}
 
-        return count;
-    }
-} else struct {
-    pub fn strlen(str: []const u8) usize {
-        return str.len;
-    }
-}).strlen;
+/// get the byte index based on codepoint index
+const cpIndex = if (use_utf8) cpIndexUtf8 else cpIndexAscii;
 
 test "codepoint index" {
     try expectEqual(cpIndex("hello", 3), 3);
-    try expectEqual(cpIndex("⇧hello", 3), 5);
+    if (use_utf8) try expectEqual(cpIndex("⇧hello", 3), 5);
+}
+
+pub fn strlenUtf8(str: []const u8) usize {
+    var iter = Iterator.init(str);
+    var count = 0;
+
+    while (iter.next()) {
+        count += 1;
+    }
+
+    return count;
+}
+
+pub fn strlenAscii(str: []const u8) usize {
+    return str.len;
+}
+
+/// get the string length in codepoints
+const strlen = if (use_utf8) strlenUtf8 else strlenAscii;
+
+pub fn isWhitespaceUtf8(cp: u21) bool {
+    return uucode.get(.general_category, cp) == .separator_space;
+}
+
+pub const isWhitespace = if (use_utf8) isWhitespaceUtf8 else std.ascii.isWhitespace;
+
+test "Is whitespace" {
+    try expect(isWhitespace(" "));
+    try expect(!isWhitespace("a"));
+
+    if (use_utf8) {
+        try expect(!isWhitespace("a"));
+    }
 }
 
 /// pattern points to a string like "[^a-z\ub5]"
@@ -204,7 +162,7 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
 
     var pattern_iter = Iterator.init(pattern);
 
-    const to_check = Uppercase.from(cp, flags.case_insensitive);
+    const to_check = condUpper(cp, flags.case_insensitive);
 
     if (flags.charset_scan) {
         if (pattern_iter.peek() == '^') {
@@ -214,7 +172,7 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
 
         // Special case. If the first char is ']', it is part of the set
         if (pattern_iter.peek() == ']') {
-            if (to_check.cmp(Uppercase.from(']', flags.case_insensitive)) == .eq) {
+            if (cp == ']') {
                 found_match = true;
             }
             _ = pattern_iter.next(); // advance iterator
@@ -227,36 +185,36 @@ pub fn charsetMatch(pattern: []const u8, cp: Codepoint, flags: StringFlags) ?usi
             break;
         }
 
-        var check_against: ?Uppercase = null;
+        var check_against: ?Codepoint = null;
 
         // Exact match
         if (pattern_cp == '\\') {
             if (pattern_iter.next()) |unwrapped| {
-                check_against = Uppercase.from(unwrapped, flags.case_insensitive);
+                check_against = condUpper(unwrapped, flags.case_insensitive);
             }
         } else {
             // Is this a range? e.g. [a-z]
             if (pattern_iter.peek() == '-') {
-                const start_cp = Uppercase.from(pattern_cp, flags.case_insensitive);
+                const start_cp = condUpper(pattern_cp, flags.case_insensitive);
                 _ = pattern_iter.next(); // skip -
-                const end_cp = Uppercase.from(
+                const end_cp = condUpper(
                     pattern_iter.next() orelse continue,
                     flags.case_insensitive,
                 );
 
                 // Handle reversed range too
-                if ((to_check.cmp(start_cp).compare(.gte) and to_check.cmp(end_cp).compare(.lte)) or
-                    (to_check.cmp(end_cp).compare(.gte) and to_check.cmp(start_cp).compare(.lte)))
+                if ((to_check >= start_cp and to_check <= end_cp) or
+                    (to_check >= end_cp and to_check <= start_cp))
                 {
                     found_match = true;
                 }
                 continue;
             }
 
-            check_against = Uppercase.from(pattern_cp, flags.case_insensitive);
+            check_against = condUpper(pattern_cp, flags.case_insensitive);
         }
 
-        if (check_against != null and check_against.?.cmp(to_check) == .eq) {
+        if (check_against != null and check_against == to_check) {
             found_match = true;
         }
     }
@@ -328,21 +286,21 @@ pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) b
                 if (pattern_iter.i >= pattern.len) break;
             },
             else => {
-                var check_against: Uppercase = undefined;
+                var check_against: Codepoint = undefined;
                 if (pattern_cp == '\\') {
-                    check_against = Uppercase.from(
+                    check_against = condUpper(
                         pattern_iter.next() orelse '\\',
                         case_insensitive,
                     );
                 } else {
-                    check_against = Uppercase.from(pattern_cp, case_insensitive);
+                    check_against = condUpper(pattern_cp, case_insensitive);
                 }
 
-                const to_check = Uppercase.from(
+                const to_check = condUpper(
                     string_iter.next() orelse return false,
                     case_insensitive,
                 );
-                if (check_against.cmp(to_check) != .eq) return false;
+                if (check_against != to_check) return false;
             },
         }
 

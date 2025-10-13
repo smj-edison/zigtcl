@@ -17,6 +17,16 @@ pub fn build(b: *std.Build) void {
 
     const options_mod = options.createModule();
 
+    // deps
+    const uucode_dep = b.dependency("uucode", .{
+        .target = target,
+        .optimize = optimize,
+        .fields = @as([]const []const u8, &.{
+            "general_category",
+            "simple_uppercase_mapping",
+        }),
+    });
+
     // steps
     const run_step = b.step("run", "Run the application");
     const test_step = b.step("test", "Run all tests");
@@ -28,18 +38,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    if (use_utf8) {
-        const dep = b.dependency("uucode", .{
-            .target = target,
-            .optimize = optimize,
-            .fields = @as([]const []const u8, &.{
-                "name",
-                "uppercase_mapping",
-            }),
-        });
-        root.addImport("uucode", dep.module("uucode"));
-    }
-
+    root.addImport("uucode", uucode_dep.module("uucode"));
     root.addImport("options", options_mod);
 
     // executable

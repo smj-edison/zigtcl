@@ -1,9 +1,10 @@
 const std = @import("std");
 
 pub fn main() !void {
-    const str = "+0b10";
-
-    const res = try std.fmt.parseInt(i64, str, 0);
-
-    std.debug.print("{}\n", .{res});
+    var x: u32 = 0;
+    while (x < 10) : (break) {
+        std.debug.print("x: {}\n", .{x});
+        x += 1;
+        continue;
+    }
 }
