@@ -6,6 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // options
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
+    const expr_sugar = b.option(bool, "expr-sugar", "Expression sugar (e.g. $[5 + 5])") orelse true;
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -14,6 +15,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "use_utf8", use_utf8);
+    options.addOption(bool, "expr_sugar", expr_sugar);
 
     const options_mod = options.createModule();
 

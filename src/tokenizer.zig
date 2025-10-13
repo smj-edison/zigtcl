@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const string = @import("string_utils.zig");
+const options = @import("options");
 
 const Token = struct {
     tag: Tag,
@@ -16,8 +17,6 @@ const Token = struct {
     pub const Tag = enum {
         bare_string, // Simple string
         escaped_string, // String that needs escape character conversion
-        quoted_string, // String in quotes (includes quotes)
-        escaped_quoted_string, // String that is both in quotes and has escape characters
         argument_expansion, // Argument expansion (e.g. {*})
         variable_subst, // Variable substitution
         dict_sugar, // Syntax sugar for [dict get], $foo(bar)
@@ -25,19 +24,20 @@ const Token = struct {
         word_separator, // word separator (white space)
         command_separator, // command separator (line feed or semicolon)
         end_of_file, // end of script
+        expression_sugar, // Expression sugar
 
-        pub fn symbol(tag: Tag) []const u8 {
-            return switch (tag) {
-                .string => "string",
-                .escaped_string => "escaped string",
-                .variable_subst => "variable substitution",
-                .dict_sugar => "dictionary sugar",
-                .command_subst => "command substitution",
-                .word_separator => "word separator",
-                .command_separator => "command separator",
-                .end_of_file => "end of file",
-            };
-        }
+        // pub fn symbol(tag: Tag) []const u8 {
+        //     return switch (tag) {
+        //         .string => "string",
+        //         .escaped_string => "escaped string",
+        //         .variable_subst => "variable substitution",
+        //         .dict_sugar => "dictionary sugar",
+        //         .command_subst => "command substitution",
+        //         .word_separator => "word separator",
+        //         .command_separator => "command separator",
+        //         .end_of_file => "end of file",
+        //     };
+        // }
     };
 };
 
@@ -76,6 +76,8 @@ const Tokenizer = struct {
         braced_string,
         variable_subst,
         command_subst,
+        dict_sugar,
+        expression_sugar,
         comment,
     };
 
@@ -84,16 +86,15 @@ const Tokenizer = struct {
 
         var brace_depth: u32 = undefined; // curly bracket depth
         var bracket_depth: u32 = undefined;
+        var paren_depth: u32 = undefined; // used with dict sugar
 
         var tag: Token.Tag = undefined;
         var start = self.index;
         var end: ?usize = null;
-        var line_no = self.line_no;
+        const line_no = self.line_no;
 
         var state = State.start;
         while (true) {
-            if (self.buffer[self.index] == '\n') self.line_no += 1;
-
             switch (state) {
                 .start => switch (self.buffer[self.index]) {
                     0 => {
@@ -116,34 +117,35 @@ const Tokenizer = struct {
                         tag = .escaped_string;
                         state = .escaped_string;
                     },
-                    ' ', '\t', '\r' => {
+                    ' ', '\t', '\r', 12 => {
                         tag = .word_separator;
                         state = .word_separator;
                     },
                     '\n', ';' => {
                         tag = .command_separator;
-                        state = .start;
+                        state = .command_separator;
                     },
                     '"' => {
+                        self.advance(1);
                         tag = .string;
-                        loc.start = self.index;
+                        start = self.index;
                         state = .quoted_string;
                     },
                     '{' => {
                         tag = .string;
                         brace_depth = 0;
-                        loc.start = self.index;
+                        start = self.index + 1;
                         state = .braced_string;
                     },
                     '$' => {
                         tag = .variable_subst;
-                        loc.start = self.index;
+                        start = self.index + 1;
                         state = .variable_subst;
                     },
                     '[' => {
                         tag = .command_subst;
                         bracket_depth = 0;
-                        loc.start = self.index;
+                        start = self.index + 1;
                         state = .command_subst;
                     },
                     '#' => {
@@ -156,7 +158,7 @@ const Tokenizer = struct {
                 },
                 .bare_string => {
                     switch (self.buffer[self.index]) {
-                        ' ', '\t', '\r', '\n', ';' => {
+                        0, ' ', '\t', '\r', '\n', ';' => {
                             break;
                         },
                         '\\' => {
@@ -166,24 +168,32 @@ const Tokenizer = struct {
                         },
                         else => {},
                     }
-                    self.advance(1);
+                    if (self.index != self.buffer.len) self.advance(1);
                 },
                 .quoted_string => {
                     switch (self.buffer[self.index]) {
+                        0 => {
+                            tag = .invalid;
+                            self.invalid_details = .missing_quote;
+                            state = .invalid;
+                        },
                         '"' => {
+                            end = self.index;
                             self.advance(1);
                             break;
                         },
                         '\\' => {
+                            tag = .escaped_string;
                             self.advance(1);
-                            tag = .escaped_quoted_string;
-                            self.advance(1);
+                            if (self.index != self.buffer.len) self.advance(1);
                         },
+                        else => {},
                     }
+                    state = .quoted_string;
                 },
                 .word_separator => {
                     switch (self.buffer[self.index]) {
-                        ' ', '\t', '\r' => {
+                        ' ', '\t', '\r', 12 => {
                             state = .word_separator;
                             self.advance(1);
                         },
@@ -192,7 +202,7 @@ const Tokenizer = struct {
                 },
                 .command_separator => {
                     switch (self.buffer[self.index]) {
-                        '\n', ';', ' ', '\t', '\r' => {
+                        '\n', ';', ' ', '\t', '\r', 12 => {
                             state = .command_separator;
                             self.advance(1);
                         },
@@ -201,10 +211,16 @@ const Tokenizer = struct {
                 },
                 .braced_string => {
                     switch (self.buffer[self.index]) {
+                        0 => {
+                            tag = .invalid;
+                            self.invalid_details = .missing_close_brace;
+                        },
                         '{' => {
+                            // check for {*}
                             if (brace_depth == 0 and self.buffer.len - self.index >= 3) {
                                 if (self.buffer[self.index + 1] == '*' and self.buffer[self.index + 2] == '}') {
                                     self.advance(3);
+                                    tag = .argument_expansion;
                                     break;
                                 }
                             }
@@ -212,18 +228,15 @@ const Tokenizer = struct {
                             brace_depth += 1;
                         },
                         '}' => {
-                            if (brace_depth == 0) {
-                                self.invalid_details = .characters_after_close_brace;
-                                state = .invalid;
-                            }
-
                             brace_depth -= 1;
                             if (brace_depth == 0) {
+                                end = self.index;
+
                                 // check that there's nothing after the close brace
                                 self.advance(1);
 
                                 switch (self.buffer[self.index]) {
-                                    '\n', ';', ' ', '\t', '\r' => {
+                                    '\n', ';', ' ', '\t', '\r', 0 => {
                                         break;
                                     },
                                     else => {
@@ -233,10 +246,33 @@ const Tokenizer = struct {
                                 }
                             }
                         },
+                        '\\' => {
+                            // skip
+                            self.advance(1);
+                        },
                         else => {},
                     }
 
+                    if (self.index != self.buffer.len) self.advance(1);
+                },
+                .variable_subst => {
                     self.advance(1);
+
+                    if (options.expr_sugar) {
+                        switch (self.buffer[self.index]) {
+                            '[' => {
+                                state = .expression_sugar;
+                                continue;
+                            },
+                        }
+                    }
+
+                    switch (self.buffer[self.index]) {
+                        0, '\n', ';', ' ', '\t', '\r', 12 => break,
+                        '(' => {
+                            state = .dict_sugar;
+                        },
+                    }
                 },
             }
         }
@@ -252,6 +288,9 @@ const Tokenizer = struct {
     }
 
     fn advance(self: *Tokenizer, count: usize) void {
-        self.index += count;
+        for (0..count) |_| {
+            if (self.buffer[self.index] == '\n') self.line_no += 1;
+            self.index += 1;
+        }
     }
 };
