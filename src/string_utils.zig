@@ -1,6 +1,8 @@
 const std = @import("std");
+const utf8Encode = std.unicode.utf8Encode;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 const uucode = @import("uucode");
 
@@ -362,4 +364,189 @@ pub fn findLastOccurrence(searching_for: []const u8, searching_in: []const u8) ?
 test "Find last occurrence" {
     try expectEqual(findLastOccurrence("world", "hello world world"), 12);
     try expectEqual(findLastOccurrence("world", "hello"), null);
+}
+
+fn xdigitval(c: u8) ?u4 {
+    if (c >= '0' and c <= '9')
+        return @intCast(c - '0');
+    if (c >= 'a' and c <= 'f')
+        return @intCast(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F')
+        return @intCast(c - 'A' + 10);
+    return null;
+}
+
+fn odigitval(c: u8) ?u3 {
+    if (c >= '0' and c <= '7')
+        return @intCast(c - '0');
+    return null;
+}
+
+/// Perform Tcl escape substitution of 'source', storing the result
+/// string into 'dest'. The escaped string is guaranteed to
+/// be the same length or shorter than the source string.
+/// slen is the length of the string at 'source'.
+///
+/// The function returns the length of the resulting string.
+pub fn escape(source: []const u8, dest: []u8) usize {
+    var i: usize = 0;
+    var dest_i: usize = 0;
+
+    while (i < source.len) {
+        switch (source[i]) {
+            '\\' => {
+                if (i + 1 < source.len) {
+                    i += 1;
+                    switch (source[i]) {
+                        'a' => {
+                            dest[dest_i] = 0x7;
+                        },
+                        'b' => {
+                            dest[dest_i] = 0x8;
+                        },
+                        'f' => {
+                            dest[dest_i] = 0xC;
+                        },
+                        'n' => {
+                            dest[dest_i] = '\n';
+                        },
+                        'r' => {
+                            dest[dest_i] = '\r';
+                        },
+                        't' => {
+                            dest[dest_i] = '\t';
+                        },
+                        'u', 'U', 'x' => {
+                            const sequence_start = i;
+
+                            // A unicode or hex sequence.
+                            // \x Expect 1-2 hex chars and convert to hex.
+                            // \u Expect 1-4 hex chars and convert to utf-8.
+                            // \U Expect 1-8 hex chars and convert to utf-8.
+                            // \u{NNN} supports 1-6 hex chars and convert to utf-8.
+                            // An invalid sequence means simply the escaped char.
+                            var max_chars: usize = 2;
+                            if (source[i] == 'U') {
+                                max_chars = 8;
+                            } else if (source[i] == 'u') {
+                                if (i + 1 < source.len and source[i + 1] == '{') {
+                                    max_chars = 6;
+                                    i += 1; // skip to brace
+                                } else {
+                                    max_chars = 4;
+                                }
+                            }
+
+                            i += 1;
+                            const hex_start = i;
+
+                            var codepoint: u21 = 0;
+                            while (i < source.len and i - hex_start < max_chars) : (i += 1) {
+                                const hex = xdigitval(source[i]);
+                                if (hex) |unwrapped| {
+                                    codepoint = (codepoint << 4) | unwrapped;
+                                } else break;
+                            }
+
+                            if (source[hex_start - 1] == '{') {
+                                // Did any of the following happen:
+                                // 1. Never advanced, do to invalid characters or EOF
+                                // 2. Codepoint is too large to represent
+                                // 3. Didn't end with '}'
+                                if (i - hex_start == 0 or codepoint > 0x1fffff or
+                                    (i < source.len and source[i] != '}'))
+                                {
+                                    // If so, reset cursor
+                                    i = sequence_start;
+                                } else {
+                                    // Skip closing brace
+                                    i += 1;
+                                }
+                            }
+
+                            if (i - hex_start != 0) {
+                                // Got a valid sequence, so insert
+                                if (source[sequence_start] == 'x') {
+                                    dest[dest_i] = @intCast(codepoint);
+                                    dest_i += 1;
+                                } else {
+                                    dest_i += utf8Encode(codepoint, dest[dest_i..]) catch blk: {
+                                        break :blk utf8Encode(0xFFFD, dest[dest_i..]) catch unreachable;
+                                    };
+                                }
+                                continue;
+                            }
+
+                            // Not a valid codepoint, just an escaped char
+                            dest[dest_i] = source[i];
+                        },
+                        'v' => {
+                            dest[dest_i] = 0xB;
+                        },
+                        0x0 => {
+                            dest[dest_i] = '\\';
+                        },
+                        '\n' => {
+                            // Replace all spaces and tabs after backslash newline with a single space
+                            i += 1;
+                            dest[dest_i] = ' ';
+                            while (i < source.len and (source[i] == ' ' or source[i] == '\t')) {
+                                i += 1;
+                            }
+                        },
+                        '0'...'7' => {
+                            const result = blk: {
+                                const first = odigitval(source[i]).?;
+                                var codepoint: u8 = @intCast(first);
+
+                                i += 1;
+                                if (i == source.len) break :blk codepoint;
+                                if (odigitval(source[i])) |second| {
+                                    codepoint = (@as(u8, @intCast(codepoint)) << 3) | second;
+                                } else break :blk codepoint;
+
+                                i += 1;
+                                if (i == source.len) break :blk codepoint;
+                                if (odigitval(source[i])) |third| {
+                                    codepoint = (@as(u8, @intCast(codepoint)) << 3) | third;
+                                }
+
+                                break :blk codepoint;
+                            };
+
+                            dest[dest_i] = result;
+                        },
+                        else => {
+                            dest[dest_i] = source[i];
+                        },
+                    }
+                } else {
+                    dest[dest_i] = source[i];
+                }
+            },
+            else => {
+                dest[dest_i] = source[i];
+            },
+        }
+
+        i += 1;
+        dest_i += 1;
+    }
+
+    return dest_i;
+}
+
+test "Tcl escape" {
+    var alloc = std.heap.page_allocator;
+    try testEscape(&alloc, "A B C D E \n",
+        \\\x41 \102 \u43 \u{44} \E \n
+    );
+}
+
+fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []const u8) !void {
+    const write_into = alloc.alloc(u8, to_escape.len) catch @panic("Can't allocate for test");
+    defer alloc.free(write_into);
+
+    const len = escape(to_escape, write_into);
+    try expectEqualSlices(u8, expected, write_into[0..len]);
 }

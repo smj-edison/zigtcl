@@ -1,10 +1,11 @@
-// this is cobbled together from Molt, Zig's tokenizer, and Jimtcl
+// This is cobbled together from Molt, Zig's tokenizer, and Jimtcl
 
 const std = @import("std");
 const isWhitespace = std.ascii.isWhitespace;
 const isAlphanumeric = std.ascii.isAlphanumeric;
 
 const expectEqual = std.testing.expectEqual;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 const string = @import("string_utils.zig");
 const options = @import("options");
@@ -699,17 +700,26 @@ test "Parser" {
 
     var parser = Parser.init(script);
 
-    try expectEqual((try parser.next()), Token{
-        .tag = .simple_string,
-        .loc = .{
-            .start = 0,
-            .end = 3,
-            .line_no = 0,
-        },
-    });
-    try expectEqual(.word_separator, (try parser.next()).tag);
-    try expectEqual(.simple_string, (try parser.next()).tag);
-    try expectEqual(.word_separator, (try parser.next()).tag);
-    try expectEqual(.simple_string, (try parser.next()).tag);
-    try expectEqual(.command_separator, (try parser.next()).tag);
+    try testNextToken(&parser, .simple_string, "set");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "x");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "5");
+    try testNextToken(&parser, .command_separator, "\n");
+
+    try testNextToken(&parser, .simple_string, "set");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "y");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "a b c");
+}
+
+fn testNextToken(parser: *Parser, expected_type: Token.Tag, expected_value: []const u8) !void {
+    const next = parser.next() catch |err| {
+        std.debug.print("Error caught when parsing: {}", .{err});
+        return error.TestUnexpectedResult;
+    };
+
+    try expectEqual(expected_type, next.tag);
+    try expectEqualSlices(u8, expected_value, parser.buffer[next.loc.start..next.loc.end]);
 }
