@@ -15,7 +15,7 @@ const StringFlags = packed struct(u32) {
 const Codepoint = if (use_utf8) u21 else u8;
 
 fn toUppercaseUtf8(cp: u21) u21 {
-    return uucode.get(.simple_uppercase_mapping, cp);
+    return uucode.get(.simple_uppercase_mapping, cp) orelse cp;
 }
 
 const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
@@ -27,6 +27,12 @@ fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
     } else {
         return cp;
     }
+}
+
+test "Conditional uppercase" {
+    try expectEqual('A', condUpper('a', true));
+    try expectEqual('a', condUpper('a', false));
+    try expectEqual('/', condUpper('/', true));
 }
 
 const AsciiIterator = struct {
@@ -96,7 +102,7 @@ pub fn cpIndexUtf8(str: []const u8, index: usize) ?usize {
 }
 
 pub fn cpIndexAscii(str: []const u8, index: usize) ?usize {
-    if (index >= str.length) return null;
+    if (index >= str.len) return null;
     return index;
 }
 

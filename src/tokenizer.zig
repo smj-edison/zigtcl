@@ -2,12 +2,14 @@
 
 const std = @import("std");
 const isWhitespace = std.ascii.isWhitespace;
+const isAlphanumeric = std.ascii.isAlphanumeric;
+
 const expectEqual = std.testing.expectEqual;
 
 const string = @import("string_utils.zig");
 const options = @import("options");
 
-const Token = struct {
+pub const Token = struct {
     tag: Tag,
     loc: Location,
 
@@ -21,7 +23,6 @@ const Token = struct {
         none, // Nothing (can be safely ignored)
         simple_string, // Simple string (no escaping needed)
         escaped_string, // String that needs escape character conversion
-        argument_expansion, // Argument expansion (e.g. {*})
         variable_subst, // Variable substitution
         dict_sugar, // Syntax sugar for [dict get], $foo(bar)
         command_subst, // command substitution
@@ -32,7 +33,7 @@ const Token = struct {
     };
 };
 
-const Parser = struct {
+pub const Parser = struct {
     buffer: []const u8,
     index: usize,
     line_no: u32, // current line number
@@ -47,12 +48,12 @@ const Parser = struct {
     error_details: ?struct { line_no: u32, index: usize },
 
     const Error = error{
-        missing_close_bracket,
-        missing_close_brace,
-        characters_after_close_brace,
-        trailing_backslash,
-        missing_quote,
-        embedded_null,
+        MissingCloseBracket,
+        MissingCloseBrace,
+        MissingCloseQuote,
+        CharactersAfterCloseBrace,
+        TrailingBackslash,
+        NotVariable,
     };
 
     pub fn init(buffer: []const u8) Parser {
@@ -67,14 +68,13 @@ const Parser = struct {
         };
     }
 
-    pub fn next(self: *Parser) Error!Token {
-        self.error_details = null;
+    pub fn next(self: *Parser) !Token {
         const token: ?Token = blk: {
             while (!self.atEnd()) {
                 switch (self.current()) {
                     '\\' => {
                         if (self.peek(1) == '\n' and !self.in_quote) {
-                            // escaped newline without quotes = word separator
+                            // escaped newline, not in quotes = word separator
                             break :blk self.parseSeparator();
                         }
                         break :blk try self.parseString();
@@ -101,11 +101,22 @@ const Parser = struct {
                     },
                     '$' => {
                         self.comment_possible = false;
-                        self.parseVariable();
+                        return self.parseVariable() catch |err| {
+                            if (err == Error.NotVariable) {
+                                // An orphan '$'. Create a token for it.
+                                var token = self.newToken();
+                                token.tag = .simple_string;
+                                self.advance(1);
+                                token.loc.end = self.index;
+                                return token;
+                            } else {
+                                return err;
+                            }
+                        };
                     },
                     '#' => {
                         if (self.comment_possible) {
-                            self.parseComment();
+                            _ = try self.parseComment();
                         } else {
                             return self.parseString();
                         }
@@ -124,7 +135,7 @@ const Parser = struct {
         } else {
             if (self.in_quote) {
                 // Ended without closing the quote
-                return Error.missing_quote;
+                return Error.MissingCloseQuote;
             }
 
             return .{
@@ -138,7 +149,7 @@ const Parser = struct {
         }
     }
 
-    fn parseString(self: *Parser) Error!Token {
+    fn parseString(self: *Parser) !Token {
         switch (self.last_token_type) {
             .none, .word_separator, .command_separator, .simple_string, .escaped_string => {
                 // This checks if we're at the start of a new word. We need to check because code such as
@@ -177,7 +188,7 @@ const Parser = struct {
                         return token;
                     }
                     self.advance(1); // skip character after \
-                    try self.errorIfAtEnd(Error.trailing_backslash);
+                    try self.errorIfAtEndAfterBackslash();
 
                     self.advance(1);
                 },
@@ -234,7 +245,7 @@ const Parser = struct {
 
         // If we reached here, it means we reached the end of the input
         if (self.in_quote) {
-            return Error.missing_quote;
+            return Error.MissingCloseQuote;
         } else {
             token.loc.end = self.index;
             token.tag = .escaped_string;
@@ -242,7 +253,7 @@ const Parser = struct {
         }
     }
 
-    fn parseQuote(self: *Parser) Error!Token {
+    fn parseQuote(self: *Parser) !Token {
         // save for potential error message later if there's a missing close quote
         const line_no = self.line_no;
         const index = self.index;
@@ -259,7 +270,7 @@ const Parser = struct {
                     token.tag = .escaped_string;
 
                     self.advance(1); // skip character after escape
-                    try self.errorIfAtEnd(Error.trailing_backslash);
+                    try self.errorIfAtEndAfterBackslash();
                 },
                 '"' => {
                     token.loc.end = self.index;
@@ -269,7 +280,7 @@ const Parser = struct {
                 },
                 '[' => {
                     // parseCommand will advance the index just past the end of the command
-                    try self.parseCommand();
+                    _ = try self.parseCommand();
                     // skip advancing this time, because parseCommand already did that
                     continue;
                 },
@@ -279,6 +290,7 @@ const Parser = struct {
                     token.loc.end = self.index;
                     return token;
                 },
+                else => {},
             }
 
             self.advance(1);
@@ -290,7 +302,137 @@ const Parser = struct {
             .index = index,
             .line_no = line_no,
         };
-        return Error.missing_quote;
+        return Error.MissingCloseQuote;
+    }
+
+    fn parseVariable(self: *Parser) !Token {
+        const start = self.mark();
+
+        // Skip the '$'
+        self.advance(1);
+
+        if (self.atEnd()) {
+            // rewind our location
+            self.restore(start);
+            return Error.NotVariable;
+        }
+
+        if (options.bracket_expr_sugar and self.current() == '[') {
+            // Parse $[...] expr shorthand syntax
+            var command_token = try self.parseCommand();
+            command_token.tag = .expression_sugar;
+            return command_token;
+        }
+
+        var token = self.newToken();
+        token.tag = .variable_subst;
+
+        // Braced variable? (e.g. ${foo})
+        if (self.current() == '{') {
+            const brace_index = self.index;
+            const brace_line_no = self.line_no;
+
+            self.advance(1);
+            // set new token location to inside the brace
+            token.loc.start = self.index;
+            token.loc.line_no = self.line_no;
+
+            // search for closing brace
+            var found_closing_brace = false;
+            while (!self.atEnd()) : (self.advance(1)) {
+                if (self.current() == '}') {
+                    found_closing_brace = true;
+                    break;
+                }
+            }
+
+            if (!found_closing_brace) {
+                self.error_details = .{
+                    .index = brace_index,
+                    .line_no = brace_line_no,
+                };
+                return Error.MissingCloseBrace;
+            }
+
+            token.loc.end = self.index;
+
+            // be sure to point at past the brace
+            if (!self.atEnd()) self.advance(1);
+        } else {
+            // Just a normal variable.
+            while (!self.atEnd()) {
+                // Skip double colon, but not single colon!
+                if (self.current() == ':' and self.peek(1) == ':') {
+                    self.advance(2);
+                    continue;
+                }
+                // Note that any char >= 0x80 must be part of a utf-8 char.
+                // We consider all unicode points outside of ASCII as letters
+                if (isAlphanumeric(self.current()) or self.current() == '_' or self.current() >= 0x80) {
+                    self.advance(1);
+                    continue;
+                }
+                // None of the above, so we've reached the end of this variable
+                // (excluding dictionary sugar, which we'll address next).
+                break;
+            }
+
+            // Parse [dict get] syntax sugar (e.g. $foo(bar)).
+            if (!self.atEnd() and self.current() == '(') {
+                token.tag = .dict_sugar;
+
+                self.advance(1); // skip '('
+
+                var paren_depth: u32 = 1;
+                // We need to keep track of the last seen closing paren,
+                // because the parser will happily keep chugging along
+                // until it's consumed everything. If that's the case,
+                // we'll just rewind to the last seen closing paren.
+                var last_seen_closing_paren: ?Mark = null;
+                while (!self.atEnd() and paren_depth > 0) {
+                    switch (self.current()) {
+                        '\\' => {
+                            self.advance(1);
+                            try self.errorIfAtEndAfterBackslash();
+                        },
+                        '(' => {
+                            paren_depth += 1;
+                        },
+                        ')' => {
+                            last_seen_closing_paren = self.mark();
+                            paren_depth -= 1;
+                        },
+                        else => {},
+                    }
+                    self.advance(1);
+                }
+
+                if (paren_depth != 0 and last_seen_closing_paren != null) {
+                    // We ended unbalanced and may have consumed the universe,
+                    // so rewind to the last closing paren
+                    self.restore(last_seen_closing_paren.?);
+                    self.advance(1);
+                }
+
+                if (!options.bracket_expr_sugar and self.buffer[token.loc.start] == '(') {
+                    // We can either have $[] for expression sugar, or $(). This branch
+                    // is for the latter case (we handled the former earlier).
+                    token.tag = .expression_sugar;
+                }
+            }
+
+            token.loc.end = self.index;
+        }
+
+        // Check if we parsed just the '$' character. That's not a variable, so an
+        // error is returned to tell the parser to consider this '$' as just
+        // a string.
+        if (token.loc.start == self.index) {
+            self.restore(start);
+            return Error.NotVariable;
+        }
+
+        return token;
     }
 
     fn parseCommand(self: *Parser) Error!Token {
@@ -314,7 +456,7 @@ const Parser = struct {
                 '\\' => {
                     // Skip character after escape
                     self.advance(1);
-                    try self.errorIfAtEnd(Error.trailing_backslash);
+                    try self.errorIfAtEndAfterBackslash();
                 },
                 '[' => {
                     bracket_level += 1;
@@ -326,20 +468,20 @@ const Parser = struct {
                         self.advance(1);
 
                         token.tag = .command_subst;
-                        token.end = self.index;
+                        token.loc.end = self.index;
                         return token;
                     }
                 },
                 '"' => {
                     if (start_of_word) {
                         // advance to just past where the quoted word ends
-                        try self.parseQuote();
+                        _ = try self.parseQuote();
                         continue;
                     }
                 },
                 '{' => {
                     // advance to just past where the brace ends
-                    try self.parseBrace();
+                    _ = try self.parseBrace();
                     start_of_word = false; // have to set because of the continue
                     continue;
                 },
@@ -358,10 +500,10 @@ const Parser = struct {
             .line_no = line_no,
             .index = index,
         };
-        return Error.missing_close_bracket;
+        return Error.MissingCloseBracket;
     }
 
-    fn parseBrace(self: *Parser) Error!Token {
+    fn parseBrace(self: *Parser) !Token {
         // Save the current line in case the braces are mismatched (so we can point
         // right to where the problem is)
         const line_no = self.line_no;
@@ -389,7 +531,7 @@ const Parser = struct {
                         // afterwards.
                         if (self.peek(1)) |char| {
                             if (!isWhitespace(char)) {
-                                return Error.characters_after_close_brace;
+                                return Error.CharactersAfterCloseBrace;
                             }
                         }
 
@@ -405,25 +547,22 @@ const Parser = struct {
                     // \n escape makes serialization of programs a pain (plus it's a rather
                     // big gotcha)
                     self.advance(1);
-                    if (self.atEnd()) {
-                        self.error_details = .{
-                            .index = self.index,
-                            .line_no = self.line_no,
-                        };
-                        return Error.trailing_backslash;
-                    }
+                    try self.errorIfAtEndAfterBackslash();
                 },
                 else => {},
             }
         }
 
+        // If we've reached this point, it means we've reached the end of input without
+        // our braces being balanced. As such, we should error.
         self.error_details = .{
             .line_no = line_no,
             .index = index,
         };
-        return Error.missing_close_brace;
+        return Error.MissingCloseBrace;
     }
 
+    /// Parse until the end of the line.
     fn parseEol(self: *Parser) Token {
         var token = self.newToken();
 
@@ -463,6 +602,23 @@ const Parser = struct {
         return token;
     }
 
+    fn parseComment(self: *Parser) !void {
+        // Consume characters until \n (excluding escaping)
+        while (!self.atEnd()) : (self.advance(1)) {
+            switch (self.current()) {
+                '\\' => {
+                    self.advance(1); // skip escaped character
+                    try self.errorIfAtEndAfterBackslash();
+                },
+                '\n' => {
+                    self.advance(1);
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
     /// Initializes .start and .line_no. Caller must initialize all other fields
     fn newToken(self: *Parser) Token {
         return .{
@@ -475,14 +631,31 @@ const Parser = struct {
         };
     }
 
-    fn errorIfAtEnd(self: *Parser, error_type: Error) Error!void {
+    fn errorIfAtEndAfterBackslash(self: *Parser) !void {
         if (self.atEnd()) {
             self.error_details = .{
                 .index = self.index,
                 .line_no = self.line_no,
             };
-            return error_type;
+            return Error.TrailingBackslash;
         }
+    }
+
+    const Mark = struct {
+        index: usize,
+        line_no: u32,
+    };
+
+    fn mark(self: *Parser) Mark {
+        return .{
+            .index = self.index,
+            .line_no = self.line_no,
+        };
+    }
+
+    fn restore(self: *Parser, mark_loc: Mark) void {
+        self.index = mark_loc.index;
+        self.line_no = mark_loc.line_no;
     }
 
     fn current(self: *Parser) u8 {

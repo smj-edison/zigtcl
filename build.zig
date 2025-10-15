@@ -6,7 +6,9 @@ pub fn build(b: *std.Build) void {
 
     // options
     const use_utf8 = b.option(bool, "use-utf8", "UTF-8 support") orelse true;
-    const expr_sugar = b.option(bool, "expr-sugar", "Expression sugar (e.g. $[5 + 5])") orelse true;
+    const bracket_expr_sugar = b.option(bool, "bracket-expr-sugar",
+        \\Expression sugar with brackets instead of with parenthesis (e.g. $[5 + 5] instead of $(5 + 5))
+    ) orelse false;
     const test_filters = b.option(
         [][]const u8,
         "test-filter",
@@ -15,7 +17,7 @@ pub fn build(b: *std.Build) void {
 
     const options = b.addOptions();
     options.addOption(bool, "use_utf8", use_utf8);
-    options.addOption(bool, "expr_sugar", expr_sugar);
+    options.addOption(bool, "bracket_expr_sugar", bracket_expr_sugar);
 
     const options_mod = options.createModule();
 
@@ -24,7 +26,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{
-            "general_category",
             "simple_uppercase_mapping",
         }),
     });
@@ -52,7 +53,6 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     const run_exe = b.addRunArtifact(exe);
-
     run_step.dependOn(&run_exe.step);
 
     // tests
