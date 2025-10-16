@@ -143,7 +143,7 @@ pub fn initAlloc(allocator: Allocator) !*Object {
         .mutable = true,
         .ref_counted = true,
         .is_compact_list = false,
-        .is_synthetic_head = false,
+        .is_synthetic = false,
     };
 
     return obj;
@@ -174,8 +174,8 @@ pub const ConstRef = struct {
 
 /// Releases an object that's on the stack.
 pub fn deinit(obj: Object, alloc: Allocator) void {
-    freeString(alloc, obj.asRef());
-    freeBody(alloc, obj.asRef());
+    invalidateString(alloc, obj.asRef());
+    invalidateBody(alloc, obj.asRef());
     // Don't free the head or body, since they're on the stack
 }
 
@@ -224,7 +224,7 @@ pub fn release(alloc: Allocator, ref: Ref) void {
     if (after_sub == 0) {
         // We'll never reach here if it's on the stack, since its ref_count
         // was initialized to 1, and sub_by would be 0.
-        freeStringAndBody(alloc, ref);
+        freeInternals(alloc, ref);
         const obj_ptr: *Object = @fieldParentPtr("head", ref.head);
         const original_ptr: [*:0]u8 = @ptrCast(obj_ptr);
         const original_slice = original_ptr[0..size(ref)];
@@ -302,7 +302,7 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
                 for (0..i) |j| {
                     const dest_body = &dest.body.compact_list.elements[j];
 
-                    freeStringAndBody(allocator, .{
+                    freeInternals(allocator, .{
                         .head = &synthetic_head,
                         .body = dest_body,
                     });
@@ -338,7 +338,7 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
             }
             errdefer {
                 for (0..i) |j| {
-                    freeStringAndBody(allocator, new_list[j].asRef());
+                    freeInternals(allocator, new_list[j].asRef());
                 }
             }
 
@@ -372,8 +372,8 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
             }
             errdefer {
                 for (0..i) |j| {
-                    freeStringAndBody(allocator, new_hash_map.keys()[j].asRef());
-                    freeStringAndBody(allocator, new_hash_map.values()[j].asRef());
+                    freeInternals(allocator, new_hash_map.keys()[j].asRef());
+                    freeInternals(allocator, new_hash_map.values()[j].asRef());
                 }
             }
 
@@ -493,30 +493,40 @@ pub const ObjectListRef = union(enum) {
 };
 
 fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
+    const QuotingTypeAndString = struct {
+        quoting_type: string_utils.QuotingType,
+        string: [:0]u8,
+    };
+
     // Keep all the quoting results on the stack, if possible. If not,
     // we'll make an allocation.
-    var calculated_quoting_types: []string_utils.QuotingType = undefined;
-    var quoting_types_on_stack: [32]string_utils.QuotingType = undefined;
-    if (list.length() > quoting_types_on_stack.len) {
-        calculated_quoting_types = try allocator.alloc(string_utils.QuotingType, list.length());
+    var sub_strings: []QuotingTypeAndString = undefined;
+    var sub_strings_on_stack: [32]QuotingTypeAndString = undefined;
+    if (list.length() > sub_strings_on_stack.len) {
+        sub_strings = try allocator.alloc(QuotingTypeAndString, list.length());
     } else {
-        calculated_quoting_types = quoting_types_on_stack[0..list.length()];
+        sub_strings = sub_strings_on_stack[0..list.length()];
     }
-    defer if (calculated_quoting_types.ptr != quoting_types_on_stack[0..].ptr) {
-        allocator.free(calculated_quoting_types);
+    defer if (sub_strings.ptr != sub_strings_on_stack[0..].ptr) {
+        allocator.free(sub_strings);
     };
 
     var total_length: usize = 0;
     for (0..list.length()) |i| {
+        // Calculate the string only once, because getString may transfer ownership
+        // to us if this is a compact list
         const element_string = try getString(allocator, list.get(i));
-        calculated_quoting_types[i] = string_utils.calculateNeededQuotingType(element_string);
-        if (i == 0 and calculated_quoting_types[i] == .bare and
+        sub_strings[i] = .{
+            .quoting_type = string_utils.calculateNeededQuotingType(element_string),
+            .string = element_string,
+        };
+        if (i == 0 and sub_strings[i].quoting_type == .bare and
             element_string.len > 0 and element_string[0] == '#')
         {
             // Make sure the first element has # escaped in braces
-            calculated_quoting_types[i] = .brace;
+            sub_strings[i].quoting_type = .brace;
         }
-        total_length += string_utils.quoteSize(calculated_quoting_types[i], element_string.len);
+        total_length += string_utils.quoteSize(sub_strings[i].quoting_type, element_string.len);
         total_length += 1; // space between each element
     }
 
@@ -527,8 +537,8 @@ fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
     for (0..list.length()) |i| {
         const element_string = try getString(allocator, list.get(i));
         written += string_utils.quoteString(
-            calculated_quoting_types[i],
-            element_string,
+            sub_strings[i].quoting_type,
+            sub_strings[i].string,
             unfinished_str[written..],
             i == 0,
         );
@@ -556,7 +566,7 @@ fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
     return finished_str[0..(written - 1) :0];
 }
 
-/// For internal use only. If head.is_synthetic_head, this will
+/// For internal use only. If head.is_synthetic, this will
 /// return a string that transfers ownership to the caller.
 fn getString(allocator: Allocator, ref: Ref) Allocator.Error![:0]u8 {
     // Check if it already has a string representation
@@ -635,23 +645,26 @@ test "Get string" {
     var obj = init();
     obj.head.tag = .number;
     obj.body.number = 10;
-    defer freeStringAndBody(ta, obj.asRef());
+    defer freeInternals(ta, obj.asRef());
 
     try expectEqualSlices(u8, "10", try getString(ta, obj.asRef()));
 }
 
-pub fn freeStringAndBody(alloc: Allocator, ref: Ref) void {
+/// Frees the string and body
+pub fn freeInternals(alloc: Allocator, ref: Ref) void {
     freeString(alloc, ref);
-    freeBody(alloc, ref);
+    invalidateBody(alloc, ref);
 }
 
+/// This is slightly different than invalidateString, because invalidateString
+/// won't free a compact list's string, while this will
 pub fn freeString(allocator: Allocator, ref: Ref) void {
     if (ref.head.bytes) |bytes| {
         allocator.free(bytes[0..ref.head.length :0]);
         ref.head.bytes = null;
-    } else if (ref.head.tag == .string) {
-        // If we're a compact string, head.bytes will be null, but
-        // body.string.bytes will hold a value
+    } else if (ref.head.is_synthetic and ref.head.tag == .string) {
+        // If we're a compact list's string, head.bytes will be null, but
+        // body.string.bytes may hold a value
         if (ref.body.string.bytes) |bytes| {
             allocator.free(bytes[0..ref.body.string.byte_length]);
             ref.body.string.bytes = null;
@@ -659,9 +672,16 @@ pub fn freeString(allocator: Allocator, ref: Ref) void {
     }
 }
 
-/// Caller is responsible for syncing the body
+pub fn invalidateString(allocator: Allocator, ref: Ref) void {
+    if (ref.head.bytes) |bytes| {
+        allocator.free(bytes[0..ref.head.length :0]);
+        ref.head.bytes = null;
+    }
+}
+
+/// Caller is responsible for syncing the body contents
 /// across threads before calling.
-pub fn freeBody(alloc: Allocator, ref: Ref) void {
+pub fn invalidateBody(alloc: Allocator, ref: Ref) void {
     if (ref.head.tag == .none) return; // nothing to do
 
     // Special case: is it a compact list?
@@ -687,9 +707,9 @@ pub fn freeBody(alloc: Allocator, ref: Ref) void {
             .is_synthetic = true,
         };
 
-        // Release each item
+        // Release each item's internals
         for (0..ref.body.compact_list.length) |i| {
-            freeStringAndBody(alloc, .{
+            freeInternals(alloc, .{
                 .head = &synthetic_head,
                 .body = &ref.body.compact_list.elements[i],
             });
@@ -705,7 +725,7 @@ pub fn freeBody(alloc: Allocator, ref: Ref) void {
             const list = ref.body.list;
 
             for (0..list.length) |i| {
-                freeStringAndBody(alloc, list.elements[i].asRef());
+                freeInternals(alloc, list.elements[i].asRef());
             }
 
             alloc.free(list.elements[0..list.capacity]);
@@ -716,8 +736,8 @@ pub fn freeBody(alloc: Allocator, ref: Ref) void {
             // Be sure to free the keys and values before freeing the container
             var iter = hash_map.iterator();
             while (iter.next()) |entry| {
-                freeStringAndBody(alloc, entry.key_ptr.asRef());
-                freeStringAndBody(alloc, entry.value_ptr.asRef());
+                freeInternals(alloc, entry.key_ptr.asRef());
+                freeInternals(alloc, entry.value_ptr.asRef());
             }
 
             hash_map.deinit(alloc);
