@@ -18,4 +18,5 @@ test {
     // @import("std").testing.refAllDecls(@This());
     _ = @import("string_utils.zig");
     _ = @import("parser.zig");
+    _ = @import("Object.zig");
 }

@@ -23,6 +23,7 @@ pub const Token = struct {
     pub const Tag = enum {
         none, // Nothing (can be safely ignored)
         simple_string, // Simple string (no escaping needed)
+        brace_string, // String that was in braces (to disambiguate * from {*})
         escaped_string, // String that needs escape character conversion
         variable_subst, // Variable substitution
         dict_sugar, // Syntax sugar for [dict get], $foo(bar)
@@ -61,7 +62,7 @@ pub const Parser = struct {
         return .{
             .buffer = buffer,
             .index = 0,
-            .line_no = 0,
+            .line_no = 1,
             .in_quote = false,
             .comment_possible = true,
             .last_token_type = .none,
@@ -69,7 +70,7 @@ pub const Parser = struct {
         };
     }
 
-    pub fn next(self: *Parser) !Token {
+    pub fn parseScript(self: *Parser) !Token {
         const token: ?Token = blk: {
             while (!self.atEnd()) {
                 switch (self.current()) {
@@ -515,6 +516,7 @@ pub const Parser = struct {
         var brace_depth: usize = 1;
 
         var token = self.newToken();
+        token.tag = .brace_string;
 
         while (!self.atEnd()) : (self.advance(1)) {
             switch (self.current()) {
@@ -539,7 +541,6 @@ pub const Parser = struct {
                         // make sure to point at after the closing brace
                         self.advance(1);
 
-                        token.tag = .simple_string;
                         return token;
                     }
                 },
@@ -618,6 +619,101 @@ pub const Parser = struct {
                 else => {},
             }
         }
+    }
+
+    pub fn parseList(self: *Parser) !Token {
+        if (self.atEnd()) {
+            return .{
+                .tag = .end_of_file,
+                .loc = .{
+                    .start = self.index,
+                    .line_no = self.line_no,
+                    .end = self.index,
+                },
+            };
+        }
+
+        if (isWhitespace(self.current())) {
+            return self.parseListSeparator();
+        }
+
+        switch (self.current()) {
+            '"' => {
+                return self.parseListQuote();
+            },
+            '{' => {
+                return self.parseBrace();
+            },
+            else => {
+                return self.parseListString();
+            },
+        }
+    }
+
+    fn parseListSeparator(self: *Parser) Token {
+        var token = self.newToken();
+        token.tag = .word_separator;
+
+        while (!self.atEnd() and isWhitespace(self.current())) {
+            self.advance(1);
+        }
+
+        token.loc.end = self.index;
+        return token;
+    }
+
+    fn parseListQuote(self: *Parser) Token {
+        self.advance(1); // skip quote
+
+        var token = self.newToken();
+        token.tag = .simple_string;
+
+        while (!self.atEnd()) : (self.advance(1)) {
+            switch (self.current()) {
+                '\\' => {
+                    token.tag = .escaped_string;
+                    self.advance(1);
+
+                    // trailing backslash
+                    if (self.atEnd()) {
+                        token.loc.end = self.index;
+                        return token;
+                    }
+                },
+                '"' => {
+                    self.advance(1);
+                    token.loc.end = self.index;
+                    return token;
+                },
+            }
+        }
+
+        token.loc.end = self.index;
+        return token;
+    }
+
+    fn parseListString(self: *Parser) Token {
+        var token = self.newToken();
+        token.tag = .simple_string;
+
+        while (!self.atEnd()) : (self.advance(1)) {
+            if (isWhitespace(self.current())) {
+                token.loc.end = self.index;
+                return token;
+            } else if (self.current() == '\\') {
+                token.tag = .escaped_string;
+
+                self.advance(1);
+                if (self.atEnd()) {
+                    // Trailing backslash
+                    token.loc.end = self.index;
+                    return token;
+                }
+            }
+        }
+
+        token.loc.end = self.index;
+        return token;
     }
 
     /// Initializes .start and .line_no. Caller must initialize all other fields
@@ -711,11 +807,13 @@ test "Parser" {
     try testNextToken(&parser, .word_separator, " ");
     try testNextToken(&parser, .simple_string, "y");
     try testNextToken(&parser, .word_separator, " ");
-    try testNextToken(&parser, .simple_string, "a b c");
+    try testNextToken(&parser, .brace_string, "a b c");
+
+    try testNextToken(&parser, .end_of_file, "");
 }
 
 fn testNextToken(parser: *Parser, expected_type: Token.Tag, expected_value: []const u8) !void {
-    const next = parser.next() catch |err| {
+    const next = parser.parseScript() catch |err| {
         std.debug.print("Error caught when parsing: {}", .{err});
         return error.TestUnexpectedResult;
     };

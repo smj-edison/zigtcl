@@ -366,7 +366,7 @@ test "Find last occurrence" {
     try expectEqual(findLastOccurrence("world", "hello"), null);
 }
 
-fn xdigitval(c: u8) ?u4 {
+fn hex_digit_value(c: u8) ?u4 {
     if (c >= '0' and c <= '9')
         return @intCast(c - '0');
     if (c >= 'a' and c <= 'f')
@@ -376,7 +376,7 @@ fn xdigitval(c: u8) ?u4 {
     return null;
 }
 
-fn odigitval(c: u8) ?u3 {
+fn octal_digit_value(c: u8) ?u3 {
     if (c >= '0' and c <= '7')
         return @intCast(c - '0');
     return null;
@@ -442,7 +442,7 @@ pub fn escape(source: []const u8, dest: []u8) usize {
 
                             var codepoint: u21 = 0;
                             while (i < source.len and i - hex_start < max_chars) : (i += 1) {
-                                const hex = xdigitval(source[i]);
+                                const hex = hex_digit_value(source[i]);
                                 if (hex) |unwrapped| {
                                     codepoint = (codepoint << 4) | unwrapped;
                                 } else break;
@@ -496,18 +496,18 @@ pub fn escape(source: []const u8, dest: []u8) usize {
                         },
                         '0'...'7' => {
                             const result = blk: {
-                                const first = odigitval(source[i]).?;
+                                const first = octal_digit_value(source[i]).?;
                                 var codepoint: u8 = @intCast(first);
 
                                 i += 1;
                                 if (i == source.len) break :blk codepoint;
-                                if (odigitval(source[i])) |second| {
+                                if (octal_digit_value(source[i])) |second| {
                                     codepoint = (@as(u8, @intCast(codepoint)) << 3) | second;
                                 } else break :blk codepoint;
 
                                 i += 1;
                                 if (i == source.len) break :blk codepoint;
-                                if (odigitval(source[i])) |third| {
+                                if (octal_digit_value(source[i])) |third| {
                                     codepoint = (@as(u8, @intCast(codepoint)) << 3) | third;
                                 }
 
