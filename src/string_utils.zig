@@ -1,5 +1,7 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const utf8Encode = std.unicode.utf8Encode;
+
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
@@ -388,7 +390,7 @@ fn octal_digit_value(c: u8) ?u3 {
 /// slen is the length of the string at 'source'.
 ///
 /// The function returns the length of the resulting string.
-pub fn escape(source: []const u8, dest: []u8) usize {
+pub fn removeEscaping(source: []const u8, dest: []u8) usize {
     var i: usize = 0;
     var dest_i: usize = 0;
 
@@ -547,6 +549,192 @@ fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []cons
     const write_into = alloc.alloc(u8, to_escape.len) catch @panic("Can't allocate for test");
     defer alloc.free(write_into);
 
-    const len = escape(to_escape, write_into);
+    const len = removeEscaping(to_escape, write_into);
     try expectEqualSlices(u8, expected, write_into[0..len]);
+}
+
+pub const QuotingType = enum(u8) { bare, brace, escape };
+pub fn calculateNeededQuotingType(str: []u8) QuotingType {
+    // Empty string needs to be represented in braces
+    if (str.len == 0) return QuotingType.brace;
+
+    // Whether it's possible to represent the string without
+    // braces or escaping
+    var bare_string_possible = true;
+    var brace_level: i64 = 0;
+    var bracket_level: i64 = 0;
+
+    if (str[0] == '"' or str[0] == '{') {
+        // Not possible because we began with characters that are impossible
+        // to represent without braces or escaping
+        bare_string_possible = false;
+    } else {
+        var return_bare = true;
+        for (str) |char| {
+            switch (char) {
+                ' ', '$', '"', '[', ']', ';', '\\', '\r', '\n', '\t', 12, 11 => {
+                    bare_string_possible = false;
+                    return_bare = false;
+                    break;
+                },
+                '{', '}' => {
+                    return_bare = false;
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        if (return_bare) return QuotingType.bare;
+    }
+
+    // Check for any characters that we can't represent
+    var i: usize = 0;
+    while (i < str.len) : (i += 1) {
+        switch (str[i]) {
+            '{' => {
+                brace_level += 1;
+            },
+            '}' => {
+                brace_level -= 1;
+                if (brace_level < 0) {
+                    // Unbalanced braces, so the only possible way is escaping
+                    return QuotingType.escape;
+                }
+            },
+            '[' => {
+                bracket_level += 1;
+            },
+            ']' => {
+                bracket_level -= 1;
+            },
+            '\\' => {
+                if (i + 1 < str.len) {
+                    if (str[i + 1] == '\n') {
+                        // This is a bit of an odd condition, but escaped
+                        // newlines cannot be accurately represented in braces,
+                        // as they'll be replaced with a single space. Hence,
+                        // we better go with escaping.
+                        return QuotingType.escape;
+                    } else {
+                        // skip the escaped character
+                        i += 1;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (bracket_level < 0) {
+        // Unbalanced brackets
+        return QuotingType.escape;
+    }
+
+    if (brace_level == 0) {
+        // Braces are balanced, so we can definitely represent it in braces.
+        // We'll also attempt to represent it as a bare string.
+        if (!bare_string_possible) {
+            // The string started with characters that are impossible to
+            // represent as a bare string, so braces it is.
+            return QuotingType.brace;
+        }
+
+        // Last attempt at a bare string.
+        for (str) |char| {
+            switch (char) {
+                ' ', '$', '"', '[', ']', ';', '\\', '\r', '\n', '\t', 12, 11 => {
+                    // All of these characters can't be in a bare string, so braces
+                    // it is.
+                    return QuotingType.brace;
+                },
+                else => {},
+            }
+        }
+
+        return QuotingType.bare;
+    }
+
+    // Braces weren't balanced, so we better use an escaped string
+    return QuotingType.escape;
+}
+
+pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
+    switch (quoting_type) {
+        .bare => return str_len,
+        .brace => return str_len + 2,
+        .escape => return str_len * 2,
+    }
+}
+
+/// Returns the amount written to dest
+pub fn quoteString(quoting_type: QuotingType, src: []u8, dest: []u8, escape_first_pound: bool) usize {
+    switch (quoting_type) {
+        .bare => {
+            @memmove(dest, src);
+            return src.len;
+        },
+        .brace => {
+            dest[0] = '{';
+            dest[dest.len - 1] = '}';
+            @memmove(dest[1..(dest.len - 1)], src);
+            return src.len + 2;
+        },
+        .escape => {
+            var i: usize = 0;
+            var j: usize = 0;
+
+            if (escape_first_pound and src.len > 0 and src[0] == '#') {
+                dest[j] = '\\';
+                j += 1;
+                dest[j] = '#';
+                j += 1;
+
+                i += 1;
+            }
+
+            while (i < src.len) {
+                switch (src[i]) {
+                    ' ', '$', '"', '[', ']', '{', '}', ';', '\\' => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = src[i];
+                    },
+                    '\n' => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = 'n';
+                    },
+                    '\r' => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = 'r';
+                    },
+                    '\t' => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = 't';
+                    },
+                    12 => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = 'f';
+                    },
+                    11 => {
+                        dest[j] = '\\';
+                        j += 1;
+                        dest[j] = 'v';
+                    },
+                    else => {
+                        dest[j] = src[i];
+                    },
+                }
+
+                i += 1;
+                j += 1;
+            }
+
+            return j;
+        },
+    }
 }

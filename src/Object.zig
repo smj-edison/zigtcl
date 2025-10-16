@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const expectEqual = std.testing.expectEqual;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 const string_utils = @import("string_utils.zig");
 
@@ -10,11 +11,15 @@ body: Body,
 
 const Object = @This();
 
+pub const TypeFlags = packed struct {
+    /// Can this type be in a compact list?
+    compactable: bool,
+};
 pub const CustomType = struct {
     name: []u8, // Type name
     free_body: *const fn (allocator: Allocator, ref: Ref) void,
     duplicate: *const fn (allocator: Allocator, src: Ref, dest: Ref) void,
-    update_string: *const fn (allocator: Allocator, obj: *Object) void,
+    get_string: *const fn (allocator: Allocator, obj: Ref) Allocator.Error![:0]u8,
     make_immutable: *const fn (allocator: Allocator, obj: *Object) void,
 };
 
@@ -45,17 +50,9 @@ pub const Body = packed union {
         /// If = maxInt(u32), it means the length has not been determined
         utf8_length: u32,
     },
-    list: packed struct {
-        elements: [*]Object,
-        capacity: u32,
-        length: u32,
-    },
+    list: List,
     /// Compact list stores only the body
-    compact_list: packed struct {
-        elements: [*]Body,
-        capacity: u32,
-        length: u32,
-    },
+    compact_list: CompactList,
     dictionary: packed struct {
         /// Every object must have a pregenerated string representation in the hash map
         hash_map: *HashMap,
@@ -64,6 +61,17 @@ pub const Body = packed union {
         type_ptr: *CustomType,
         value: *anyopaque,
     },
+
+    const List = packed struct {
+        elements: [*]Object,
+        capacity: u32,
+        length: u32,
+    };
+    const CompactList = packed struct {
+        elements: [*]Body,
+        capacity: u32,
+        length: u32,
+    };
 
     pub const HashMap = std.ArrayHashMapUnmanaged(Object, Object, ObjContext, true);
     pub const ObjContext = struct {
@@ -103,7 +111,7 @@ pub const Head = packed struct {
     /// but the list element's body type)
     is_compact_list: bool,
     /// Whether this is a synthetic head (e.g. not from an object)
-    is_synthetic_head: bool,
+    is_synthetic: bool,
     /// Type of object, or type of list elements, if flags.is_compact_list is true
     tag: Tag = .none,
 
@@ -121,7 +129,7 @@ pub fn init() Object {
             // the stack.
             .ref_counted = false,
             .is_compact_list = false,
-            .is_synthetic_head = false,
+            .is_synthetic = false,
         },
         .body = undefined,
     };
@@ -157,6 +165,11 @@ pub const Ref = struct {
     pub fn release(self: Ref, allocator: Allocator) void {
         Object.release(allocator, self);
     }
+};
+
+pub const ConstRef = struct {
+    head: *const Head,
+    body: *const Body,
 };
 
 /// Releases an object that's on the stack.
@@ -221,7 +234,7 @@ pub fn release(alloc: Allocator, ref: Ref) void {
 
 pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
     const bytes_to_copy: ?[:0]u8 = blk: {
-        if (src.head.is_synthetic_head) {
+        if (src.head.is_synthetic) {
             if (src.head.tag == .string and src.body.string.bytes != null) {
                 break :blk src.body.string.bytes.?[0..src.body.string.byte_length :0];
             }
@@ -235,7 +248,7 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
         var new_string: ?[:0]u8 = null;
         errdefer if (new_string) |to_free| allocator.free(to_free);
 
-        if (!dest.head.is_synthetic_head) {
+        if (!dest.head.is_synthetic) {
             new_string = try allocator.dupeZ(u8, to_copy);
             dest.head.bytes = new_string.?.ptr;
             dest.head.length = @intCast(to_copy.len);
@@ -265,7 +278,7 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
                 .ref_counted = false,
                 .mutable = false,
                 .is_compact_list = false,
-                .is_synthetic_head = true,
+                .is_synthetic = true,
                 .tag = src.head.tag,
             };
 
@@ -315,7 +328,7 @@ pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
                     .ref_counted = false,
                     .mutable = true,
                     .is_compact_list = false,
-                    .is_synthetic_head = true,
+                    .is_synthetic = true,
                     .tag = .string,
                 };
                 try duplicateOnto(allocator, .{
@@ -410,7 +423,7 @@ pub fn duplicate(allocator: Allocator, src: Ref) !Ref {
         .ref_counted = true,
         .mutable = true,
         .is_compact_list = src.head.is_compact_list,
-        .is_synthetic_head = false,
+        .is_synthetic = false,
     };
 
     try duplicateOnto(allocator, src, new_obj.asRef());
@@ -440,6 +453,193 @@ test "Object duplication" {
     try expectEqual(1, new_obj.head.ref_count);
 }
 
+pub const ObjectListRef = union(enum) {
+    normal: *Body.List,
+    compact: struct {
+        head: *Head,
+        list: *Body.CompactList,
+    },
+    dictionary: *Body.HashMap,
+
+    /// ObjectListRef must not move for the duration of this reference
+    pub fn get(self: *ObjectListRef, index: usize) Ref {
+        switch (self.*) {
+            .normal => |list| {
+                return list.elements[0..list.length][index].asRef();
+            },
+            .compact => |compact| {
+                return .{
+                    .head = compact.head,
+                    .body = &compact.list.elements[0..compact.list.length][index],
+                };
+            },
+            .dictionary => |dict| {
+                if (@rem(index, 2) == 0) {
+                    return dict.keys()[index / 2].asRef();
+                } else {
+                    return dict.values()[index / 2].asRef();
+                }
+            },
+        }
+    }
+
+    pub fn length(self: *ObjectListRef) usize {
+        switch (self.*) {
+            .normal => |list| return list.length,
+            .compact => |compact| return compact.list.length,
+            .dictionary => |dict| return dict.count() * 2,
+        }
+    }
+};
+
+fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
+    // Keep all the quoting results on the stack, if possible. If not,
+    // we'll make an allocation.
+    var calculated_quoting_types: []string_utils.QuotingType = undefined;
+    var quoting_types_on_stack: [32]string_utils.QuotingType = undefined;
+    if (list.length() > quoting_types_on_stack.len) {
+        calculated_quoting_types = try allocator.alloc(string_utils.QuotingType, list.length());
+    } else {
+        calculated_quoting_types = quoting_types_on_stack[0..list.length()];
+    }
+    defer if (calculated_quoting_types.ptr != quoting_types_on_stack[0..].ptr) {
+        allocator.free(calculated_quoting_types);
+    };
+
+    var total_length: usize = 0;
+    for (0..list.length()) |i| {
+        const element_string = try getString(allocator, list.get(i));
+        calculated_quoting_types[i] = string_utils.calculateNeededQuotingType(element_string);
+        if (i == 0 and calculated_quoting_types[i] == .bare and
+            element_string.len > 0 and element_string[0] == '#')
+        {
+            // Make sure the first element has # escaped in braces
+            calculated_quoting_types[i] = .brace;
+        }
+        total_length += string_utils.quoteSize(calculated_quoting_types[i], element_string.len);
+        total_length += 1; // space between each element
+    }
+
+    var unfinished_str = try allocator.alloc(u8, total_length + 1);
+    errdefer allocator.free(unfinished_str);
+    var written: usize = 0;
+
+    for (0..list.length()) |i| {
+        const element_string = try getString(allocator, list.get(i));
+        written += string_utils.quoteString(
+            calculated_quoting_types[i],
+            element_string,
+            unfinished_str[written..],
+            i == 0,
+        );
+
+        if (list.get(i).head.is_synthetic) {
+            // This was a temporary string, so we need to free it
+            allocator.free(element_string);
+        }
+
+        // Add a space (except at the end of the list)
+        if (i + 1 < list.length()) {
+            unfinished_str[written] = ' ';
+            written += 1;
+        }
+    }
+
+    // Slap a nul on the end
+    unfinished_str[written] = 0x00;
+    written += 1;
+
+    // We actually need to realloc, because allocator.free needs the
+    // original slice length (and we don't track the original slice
+    // length, only the accessible length)
+    const finished_str = try allocator.realloc(unfinished_str, written);
+    return finished_str[0..(written - 1) :0];
+}
+
+/// For internal use only. If head.is_synthetic_head, this will
+/// return a string that transfers ownership to the caller.
+fn getString(allocator: Allocator, ref: Ref) Allocator.Error![:0]u8 {
+    // Check if it already has a string representation
+    if (ref.head.bytes) |bytes| {
+        return bytes[0..ref.head.length :0];
+    } else if (ref.head.tag == .string and ref.body.string.bytes != null) {
+        return ref.body.string.bytes.?[0..ref.body.string.byte_length :0];
+    }
+
+    // No representation, so we better generate it
+    var new_str: [:0]u8 = undefined;
+    if (ref.head.is_compact_list) {
+        var head = Head{
+            .ref_count = 1,
+            .ref_counted = false,
+            .mutable = false,
+            .is_compact_list = false,
+            .is_synthetic = true,
+            .tag = ref.head.tag,
+        };
+        var list = ObjectListRef{
+            .compact = .{
+                .head = &head,
+                .list = &ref.body.compact_list,
+            },
+        };
+        return getListString(allocator, &list);
+    }
+
+    switch (ref.head.tag) {
+        .index => {
+            new_str = try std.fmt.allocPrintSentinel(allocator, "{}", .{ref.body.index}, 0);
+        },
+        .return_code => {
+            new_str = try std.fmt.allocPrintSentinel(allocator, "{}", .{ref.body.return_code}, 0);
+        },
+        .number => {
+            new_str = try std.fmt.allocPrintSentinel(allocator, "{}", .{ref.body.number}, 0);
+        },
+        .float => {
+            new_str = try std.fmt.allocPrintSentinel(allocator, "{}", .{ref.body.float}, 0);
+        },
+        .list => {
+            var list = ObjectListRef{
+                .normal = &ref.body.list,
+            };
+            new_str = try getListString(allocator, &list);
+        },
+        .dictionary => {
+            var list = ObjectListRef{
+                .dictionary = ref.body.dictionary.hash_map,
+            };
+            new_str = try getListString(allocator, &list);
+        },
+        .custom_type => {
+            new_str = try ref.body.custom_type.type_ptr.get_string(allocator, ref);
+        },
+        .string, .none => {
+            @panic("Tried to generate a string with no body");
+        },
+    }
+
+    if (ref.head.is_synthetic) {
+        // Caller is responsible for freeing in this case
+        return new_str;
+    } else {
+        ref.head.bytes = new_str.ptr;
+        ref.head.length = @truncate(new_str.len);
+        return new_str;
+    }
+}
+
+test "Get string" {
+    const ta = std.testing.allocator;
+
+    var obj = init();
+    obj.head.tag = .number;
+    obj.body.number = 10;
+    defer freeStringAndBody(ta, obj.asRef());
+
+    try expectEqualSlices(u8, "10", try getString(ta, obj.asRef()));
+}
+
 pub fn freeStringAndBody(alloc: Allocator, ref: Ref) void {
     freeString(alloc, ref);
     freeBody(alloc, ref);
@@ -447,7 +647,7 @@ pub fn freeStringAndBody(alloc: Allocator, ref: Ref) void {
 
 pub fn freeString(allocator: Allocator, ref: Ref) void {
     if (ref.head.bytes) |bytes| {
-        allocator.free(bytes[0..ref.head.length]);
+        allocator.free(bytes[0..ref.head.length :0]);
         ref.head.bytes = null;
     } else if (ref.head.tag == .string) {
         // If we're a compact string, head.bytes will be null, but
@@ -484,7 +684,7 @@ pub fn freeBody(alloc: Allocator, ref: Ref) void {
             .ref_counted = false,
             // Compact lists cannot contain other compact lists
             .is_compact_list = false,
-            .is_synthetic_head = true,
+            .is_synthetic = true,
         };
 
         // Release each item
@@ -543,6 +743,13 @@ pub fn size(ref: Ref) usize {
 }
 
 pub fn asRef(obj: *Object) Ref {
+    return .{
+        .head = &obj.head,
+        .body = &obj.body,
+    };
+}
+
+pub fn asConst(obj: *Object) ConstRef {
     return .{
         .head = &obj.head,
         .body = &obj.body,
