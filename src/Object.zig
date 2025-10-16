@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const expectEqual = std.testing.expectEqual;
 
-const string = @import("string_utils.zig");
+const string_utils = @import("string_utils.zig");
 
 head: Head,
 body: Body,
@@ -12,10 +12,10 @@ const Object = @This();
 
 pub const CustomType = struct {
     name: []u8, // Type name
-    deinit: *fn (allocator: Allocator, obj_ref: Ref) void,
-    duplicate: *fn (allocator: Allocator, src: Ref, dest: Ref) void,
-    update_string: *fn (allocator: Allocator, obj: *Object) void,
-    make_immutable: *fn (allocator: Allocator, obj: *Object) void,
+    free_body: *const fn (allocator: Allocator, ref: Ref) void,
+    duplicate: *const fn (allocator: Allocator, src: Ref, dest: Ref) void,
+    update_string: *const fn (allocator: Allocator, obj: *Object) void,
+    make_immutable: *const fn (allocator: Allocator, obj: *Object) void,
 };
 
 pub const Tag = enum(u5) {
@@ -40,7 +40,7 @@ pub const Body = packed union {
     string: packed struct {
         /// bytes should always equal Head.bytes (why deduplicate? in case
         /// there's a compact list of strings--the Head is not stored)
-        bytes: ?[*]u8,
+        bytes: ?[*:0]u8,
         byte_length: u32,
         /// If = maxInt(u32), it means the length has not been determined
         utf8_length: u32,
@@ -88,7 +88,7 @@ comptime {
 
 pub const Head = packed struct {
     /// String representation of value
-    bytes: ?[*]u8 = null,
+    bytes: ?[*:0]u8 = null,
     /// Length of string in bytes
     length: u32 = 0,
     /// If flags.cross_thread = true, only atomic operations will be used
@@ -144,32 +144,105 @@ pub fn initAlloc(allocator: Allocator) !*Object {
 pub const Ref = struct {
     head: *Head,
     body: *Body,
+
+    pub fn borrow(
+        self: Ref,
+        allocator: Allocator,
+        /// Whether to release the original ref if duplicated
+        release_original: bool,
+    ) !Ref {
+        return Object.borrow(allocator, self, release_original);
+    }
+
+    pub fn release(self: Ref, allocator: Allocator) void {
+        Object.release(allocator, self);
+    }
 };
 
-pub fn duplicate(allocator: Allocator, src: Ref, dest: Ref) !void {
-    const bytes_to_copy: ?[]u8 = blk: {
+/// Releases an object that's on the stack.
+pub fn deinit(obj: Object, alloc: Allocator) void {
+    freeString(alloc, obj.asRef());
+    freeBody(alloc, obj.asRef());
+    // Don't free the head or body, since they're on the stack
+}
+
+pub fn borrow(
+    allocator: Allocator,
+    ref: Ref,
+    /// Whether to release the original ref if duplicated
+    release_original: bool,
+) !Ref {
+    if (ref.head.ref_counted) {
+        if (ref.head.cross_thread) {
+            _ = @atomicRmw(u32, &ref.head.ref_count, .Add, 1, .monotonic);
+        } else {
+            ref.head.ref_count += 1;
+        }
+
+        return ref;
+    } else {
+        // Duplicate object, as it can't be referenced
+        const new_object = try duplicate(allocator, ref);
+        if (release_original) release(allocator, ref);
+        return new_object;
+    }
+}
+
+/// Releases an object reference. No operation if flags.ref_counted = false.
+/// Use `deinit` if object is on the stack.
+pub fn release(alloc: Allocator, ref: Ref) void {
+    // TODO: profile whether branchless or branched is better
+    const sub_by: u32 = @intFromBool(ref.head.ref_counted);
+    var after_sub: u32 = 0;
+
+    // Make sure to use atomic operations if it's threaded
+    if (ref.head.cross_thread) {
+        const before_sub = @atomicRmw(u32, &ref.head.ref_count, .Sub, sub_by, .release);
+        after_sub = before_sub - 1;
+
+        if (after_sub == 0) {
+            _ = @atomicLoad(u32, &ref.head.ref_count, .acquire);
+        }
+    } else {
+        ref.head.ref_count -= sub_by;
+        after_sub = ref.head.ref_count;
+    }
+
+    if (after_sub == 0) {
+        // We'll never reach here if it's on the stack, since its ref_count
+        // was initialized to 1, and sub_by would be 0.
+        freeStringAndBody(alloc, ref);
+        const obj_ptr: *Object = @fieldParentPtr("head", ref.head);
+        const original_ptr: [*:0]u8 = @ptrCast(obj_ptr);
+        const original_slice = original_ptr[0..size(ref)];
+        alloc.rawFree(original_slice, std.mem.Alignment.of(Object), @returnAddress());
+    }
+}
+
+pub fn duplicateOnto(allocator: Allocator, src: Ref, dest: Ref) !void {
+    const bytes_to_copy: ?[:0]u8 = blk: {
         if (src.head.is_synthetic_head) {
             if (src.head.tag == .string and src.body.string.bytes != null) {
-                break :blk src.body.string.bytes.?[0..src.body.string.byte_length];
+                break :blk src.body.string.bytes.?[0..src.body.string.byte_length :0];
             }
         } else if (src.head.bytes != null) {
-            break :blk src.head.bytes.?[0..src.head.length];
+            break :blk src.head.bytes.?[0..src.head.length :0];
         }
         break :blk null;
     };
 
     if (bytes_to_copy) |to_copy| {
-        var new_string: ?[]u8 = null;
+        var new_string: ?[:0]u8 = null;
         errdefer if (new_string) |to_free| allocator.free(to_free);
 
         if (!dest.head.is_synthetic_head) {
-            new_string = try allocator.dupe(u8, to_copy);
+            new_string = try allocator.dupeZ(u8, to_copy);
             dest.head.bytes = new_string.?.ptr;
             dest.head.length = @intCast(to_copy.len);
         } else if (src.head.tag == .string and dest.head.tag == .none) {
             // Copying into a synthetic head, so that means we'll
             // put the string in the body instead
-            new_string = try allocator.dupe(u8, to_copy);
+            new_string = try allocator.dupeZ(u8, to_copy);
             dest.body.string.bytes = new_string.?.ptr;
             dest.body.string.byte_length = @intCast(to_copy.len);
             dest.body.string.utf8_length = src.body.string.utf8_length;
@@ -206,7 +279,7 @@ pub fn duplicate(allocator: Allocator, src: Ref, dest: Ref) !void {
                 // to an error), it doesn't try to free an uninitialized value
                 dest_body.string.bytes = null;
 
-                try duplicate(
+                try duplicateOnto(
                     allocator,
                     .{ .head = &synthetic_head, .body = src_body },
                     .{ .head = &synthetic_head, .body = dest_body },
@@ -245,7 +318,7 @@ pub fn duplicate(allocator: Allocator, src: Ref, dest: Ref) !void {
                     .is_synthetic_head = true,
                     .tag = .string,
                 };
-                try duplicate(allocator, .{
+                try duplicateOnto(allocator, .{
                     .head = &synthetic_head,
                     .body = &src.body.compact_list.elements[i],
                 }, new_list[i].asRef());
@@ -281,8 +354,8 @@ pub fn duplicate(allocator: Allocator, src: Ref, dest: Ref) !void {
             // initialize new values
             var i: usize = 0;
             while (i < hash_map.count()) : (i += 1) {
-                try duplicate(allocator, hash_map.keys()[i].asRef(), new_hash_map.keys()[i].asRef());
-                try duplicate(allocator, hash_map.values()[i].asRef(), new_hash_map.values()[i].asRef());
+                try duplicateOnto(allocator, hash_map.keys()[i].asRef(), new_hash_map.keys()[i].asRef());
+                try duplicateOnto(allocator, hash_map.values()[i].asRef(), new_hash_map.values()[i].asRef());
             }
             errdefer {
                 for (0..i) |j| {
@@ -312,13 +385,13 @@ pub fn duplicate(allocator: Allocator, src: Ref, dest: Ref) !void {
     dest.head.tag = src.head.tag;
 }
 
-pub fn duplicateAlloc(allocator: Allocator, src: Ref) !Ref {
-    const normal_size = @alignOf(Object);
+pub fn duplicate(allocator: Allocator, src: Ref) !Ref {
+    const normal_size = @sizeOf(Object);
     var new_obj: *Object = undefined;
 
     if (src.head.is_compact_list) {
         const length = src.body.compact_list.length;
-        const compact_list_size = @alignOf(Body) * length;
+        const compact_list_size = @sizeOf(Body) * length;
         const bytes = try allocator.alignedAlloc(u8, std.mem.Alignment.of(Object), normal_size + compact_list_size);
 
         const new_list: [*]Body = @ptrCast(bytes.ptr + normal_size);
@@ -340,7 +413,7 @@ pub fn duplicateAlloc(allocator: Allocator, src: Ref) !Ref {
         .is_synthetic_head = false,
     };
 
-    try duplicate(allocator, src, new_obj.asRef());
+    try duplicateOnto(allocator, src, new_obj.asRef());
     return new_obj.asRef();
 }
 
@@ -352,97 +425,47 @@ test "Object duplication" {
     obj.head.tag = .number;
     obj.body.number = 10;
 
-    const new_obj = try duplicateAlloc(ta, obj.asRef());
+    const new_obj = try duplicate(ta, obj.asRef());
     defer release(ta, new_obj);
 
     try expectEqual(.number, new_obj.head.tag);
     try expectEqual(10, new_obj.body.number);
+
+    // try borrowing
+    const borrowed = try borrow(ta, new_obj, false);
+    try expectEqual(borrowed, new_obj);
+    try expectEqual(2, new_obj.head.ref_count);
+
+    release(ta, borrowed);
+    try expectEqual(1, new_obj.head.ref_count);
 }
 
-/// Releases an object that's on the stack.
-pub fn deinit(obj: Object, alloc: Allocator) void {
-    freeString(alloc, obj.asRef());
-    freeBody(alloc, obj.asRef());
-    // Don't free the head or body, since they're on the stack
+pub fn freeStringAndBody(alloc: Allocator, ref: Ref) void {
+    freeString(alloc, ref);
+    freeBody(alloc, ref);
 }
 
-pub fn borrow(
-    allocator: Allocator,
-    ref: Ref,
-    /// Whether to release the original ref if duplicated
-    release_original: bool,
-) !Ref {
-    if (ref.head.ref_counted) {
-        if (ref.head.cross_thread) {
-            _ = @atomicRmw(u32, &ref.head.ref_count, .Add, 1, .unordered);
-        } else {
-            ref.head.ref_count += 1;
-        }
-
-        return ref;
-    } else {
-        // Duplicate object, as it can't be referenced
-        const new_object = try duplicateAlloc(allocator, ref);
-        if (release_original) release(allocator, ref);
-        return new_object.asRef();
-    }
-}
-
-/// Releases an object reference. No operation if flags.ref_counted = false.
-/// Use `releaseStack` if object is not allocated.
-pub fn release(alloc: Allocator, obj_ref: Ref) void {
-    // TODO: profile whether branchless or branched is better
-    const sub_by: u32 = @intFromBool(obj_ref.head.ref_counted);
-    var after_sub: u32 = 0;
-
-    // Make sure to use atomic operations if it's threaded
-    if (obj_ref.head.cross_thread) {
-        const before_sub = @atomicRmw(u32, &obj_ref.head.ref_count, .Sub, sub_by, .release);
-        after_sub = before_sub - 1;
-
-        if (after_sub == 0) {
-            _ = @atomicLoad(u32, &obj_ref.head.ref_count, .acquire);
-        }
-    } else {
-        obj_ref.head.ref_count -= sub_by;
-        after_sub = obj_ref.head.ref_count;
-    }
-
-    if (after_sub == 0) {
-        // We'll never reach here if it's on the stack, since its ref_count
-        // was initialized to 1, and sub_by would be 0.
-        freeStringAndBody(alloc, obj_ref);
-        const obj_ptr: *Object = @fieldParentPtr("head", obj_ref.head);
-        const original_ptr: [*]u8 = @ptrCast(obj_ptr);
-        const original_slice = original_ptr[0..size(obj_ref)];
-        alloc.rawFree(original_slice, std.mem.Alignment.of(Object), @returnAddress());
-    }
-}
-
-pub fn freeStringAndBody(alloc: Allocator, obj_ref: Ref) void {
-    freeString(alloc, obj_ref);
-    freeBody(alloc, obj_ref);
-}
-
-pub fn freeString(allocator: Allocator, obj_ref: Ref) void {
-    if (obj_ref.head.bytes) |bytes| {
-        allocator.free(bytes[0..obj_ref.head.length]);
-    } else if (obj_ref.head.tag == .string) {
+pub fn freeString(allocator: Allocator, ref: Ref) void {
+    if (ref.head.bytes) |bytes| {
+        allocator.free(bytes[0..ref.head.length]);
+        ref.head.bytes = null;
+    } else if (ref.head.tag == .string) {
         // If we're a compact string, head.bytes will be null, but
         // body.string.bytes will hold a value
-        if (obj_ref.body.string.bytes) |bytes| {
-            allocator.free(bytes[0..obj_ref.body.string.byte_length]);
+        if (ref.body.string.bytes) |bytes| {
+            allocator.free(bytes[0..ref.body.string.byte_length]);
+            ref.body.string.bytes = null;
         }
     }
 }
 
 /// Caller is responsible for syncing the body
 /// across threads before calling.
-pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
-    if (obj_ref.head.tag == .none) return; // nothing to do
+pub fn freeBody(alloc: Allocator, ref: Ref) void {
+    if (ref.head.tag == .none) return; // nothing to do
 
     // Special case: is it a compact list?
-    if (obj_ref.head.is_compact_list) {
+    if (ref.head.is_compact_list) {
         // Because the compact list is part of the allocation of
         // the object head, we don't actually free any of the objects.
         // Instead, we just make sure that their bodies' values are
@@ -452,7 +475,7 @@ pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
             .bytes = null,
             .length = 0,
             .ref_count = 0,
-            .tag = obj_ref.head.tag,
+            .tag = ref.head.tag,
             // Not relevant, as we're running a destructor
             .cross_thread = false,
             // Needs to be mutable to free
@@ -465,21 +488,21 @@ pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
         };
 
         // Release each item
-        for (0..obj_ref.body.compact_list.length) |i| {
+        for (0..ref.body.compact_list.length) |i| {
             freeStringAndBody(alloc, .{
                 .head = &synthetic_head,
-                .body = &obj_ref.body.compact_list.elements[i],
+                .body = &ref.body.compact_list.elements[i],
             });
         }
 
-        obj_ref.body.compact_list.length = 0;
-        obj_ref.head.tag = .none;
+        ref.body.compact_list.length = 0;
+        ref.head.tag = .none;
         return;
     }
 
-    switch (obj_ref.head.tag) {
+    switch (ref.head.tag) {
         .list => {
-            const list = obj_ref.body.list;
+            const list = ref.body.list;
 
             for (0..list.length) |i| {
                 freeStringAndBody(alloc, list.elements[i].asRef());
@@ -488,7 +511,7 @@ pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
             alloc.free(list.elements[0..list.capacity]);
         },
         .dictionary => {
-            const hash_map = obj_ref.body.dictionary.hash_map;
+            const hash_map = ref.body.dictionary.hash_map;
 
             // Be sure to free the keys and values before freeing the container
             var iter = hash_map.iterator();
@@ -500,7 +523,7 @@ pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
             hash_map.deinit(alloc);
         },
         .custom_type => {
-            obj_ref.body.custom_type.type_ptr.deinit(alloc, obj_ref);
+            ref.body.custom_type.type_ptr.free_body(alloc, ref);
         },
         .string => {
             // How come string is a no-op? Because we could potentially
@@ -511,10 +534,10 @@ pub fn freeBody(alloc: Allocator, obj_ref: Ref) void {
 }
 
 /// Gets the size of an object
-pub fn size(obj_ref: Ref) usize {
-    const normal_size = @alignOf(Object);
+pub fn size(ref: Ref) usize {
+    const normal_size = @sizeOf(Object);
     const compact_list_size =
-        if (obj_ref.head.is_compact_list) @alignOf(Body) * obj_ref.body.compact_list.length else 0;
+        if (ref.head.is_compact_list) @sizeOf(Body) * ref.body.compact_list.length else 0;
 
     return normal_size + compact_list_size;
 }
