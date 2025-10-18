@@ -10,9 +10,9 @@ const string_utils = @import("string_utils.zig");
 bytes: ?[*:0]u8 = null,
 /// Length of string in bytes
 length: u32 = 0,
+/// If flags.cross_thread = true, only atomic operations will be used
+ref_count: u32,
 flags: packed struct {
-    /// If flags.cross_thread = true, only atomic operations will be used
-    ref_count: u32,
     /// Whether this object can be ref counted (else it needs to be cloned)
     ref_counted: bool,
     /// If shared across threads
@@ -85,14 +85,14 @@ pub const Body = packed union {
     pub const ObjContext = struct {
         pub fn hash(self: ObjContext, obj: Object) u32 {
             _ = self;
-            return std.array_hash_map.hashString(obj.head.bytes.?[0..obj.head.length]);
+            return std.array_hash_map.hashString(obj.bytes.?[0..obj.length]);
         }
 
         pub fn eql(self: ObjContext, a: Object, b: Object) bool {
             _ = self;
             return std.array_hash_map.eqlString(
-                a.head.bytes.?[0..a.head.length],
-                b.head.bytes.?[0..b.head.length],
+                a.bytes.?[0..a.length],
+                b.bytes.?[0..b.length],
             );
         }
     };
@@ -104,8 +104,8 @@ comptime {
 
 pub fn init() Object {
     return .{
-        .head = .{
-            .ref_count = 1,
+        .ref_count = 1,
+        .flags = .{
             .mutable = true,
             // Not ref counted, because it's currently living on
             // the stack.
@@ -116,32 +116,35 @@ pub fn init() Object {
 }
 
 pub fn initAlloc(allocator: Allocator) !*Object {
-    var obj = try allocator.alignedAlloc(Object, null, 1)[0];
+    const obj = try allocator.create(Object);
 
-    obj.head = .{
+    obj.* = .{
         .ref_count = 1,
-        .mutable = true,
-        .ref_counted = true,
+        .flags = .{
+            .mutable = true,
+            .ref_counted = true,
+        },
+        .body = undefined,
     };
 
     return obj;
 }
 
 /// Releases an object that's on the stack.
-pub fn deinit(obj: Object, alloc: Allocator) void {
-    invalidateString(alloc, obj.asRef());
-    invalidateBody(alloc, obj.asRef());
+pub fn deinit(obj: *Object, alloc: Allocator) void {
+    invalidateString(alloc, obj);
+    invalidateBody(alloc, obj);
     // Don't free the head or body, since they're on the stack
 }
 
 pub fn borrow(
-    allocator: Allocator,
     obj: *Object,
+    allocator: Allocator,
     /// Whether to release the original ref if duplicated
     release_original: bool,
 ) !*Object {
-    if (obj.ref_counted) {
-        if (obj.head.cross_thread) {
+    if (obj.flags.ref_counted) {
+        if (obj.flags.cross_thread) {
             _ = @atomicRmw(u32, &obj.ref_count, .Add, 1, .monotonic);
         } else {
             obj.ref_count += 1;
@@ -150,21 +153,21 @@ pub fn borrow(
         return obj;
     } else {
         // Duplicate object, as it can't be referenced
-        const new_object = try duplicate(allocator, obj);
-        if (release_original) release(allocator, obj);
+        const new_object = try obj.duplicate(allocator);
+        if (release_original) obj.release(allocator);
         return new_object;
     }
 }
 
 /// Releases an object. No operation if flags.ref_counted = false.
 /// Use `deinit` if object is on the stack.
-pub fn release(alloc: Allocator, obj: *Object) void {
+pub fn release(obj: *Object, alloc: Allocator) void {
     // TODO: profile whether branchless or branched is better
-    const sub_by: u32 = @intFromBool(obj.ref_counted);
+    const sub_by: u32 = @intFromBool(obj.flags.ref_counted);
     var after_sub: u32 = 0;
 
     // Make sure to use atomic operations if it's threaded
-    if (obj.cross_thread) {
+    if (obj.flags.cross_thread) {
         const before_sub = @atomicRmw(u32, &obj.ref_count, .Sub, sub_by, .release);
         after_sub = before_sub - 1;
 
@@ -179,21 +182,21 @@ pub fn release(alloc: Allocator, obj: *Object) void {
     if (after_sub == 0) {
         // We'll never reach here if it's on the stack, since its ref_count
         // was initialized to 1, and sub_by would be 0.
-        freeInternals(alloc, obj);
+        obj.freeInternals(alloc);
         alloc.destroy(obj);
     }
 }
 
-pub fn duplicateOnto(allocator: Allocator, src: *Object, dest: *Object) !void {
-    assert(dest.head.bytes == null);
-    if (src.head.bytes) |to_copy| {
-        const new_string = try allocator.dupeZ(u8, to_copy);
-        dest.head.bytes = new_string.?.ptr;
-        dest.head.length = @intCast(to_copy.len);
+pub fn duplicateOnto(src: *Object, allocator: Allocator, dest: *Object) !void {
+    assert(dest.bytes == null);
+    if (src.bytes) |to_copy| {
+        const new_string = try allocator.dupeZ(u8, to_copy[0..src.length]);
+        dest.bytes = new_string.ptr;
+        dest.length = src.length;
     }
-    errdefer if (dest.bytes != null) allocator.free(dest.bytes);
+    errdefer if (dest.bytes) |bytes| allocator.free(bytes[0..src.length]);
 
-    switch (src.head.tag) {
+    switch (src.tag) {
         .list => {
             const list = src.body.list;
             const new_list = try allocator.dupe(Object, list.elements[0..list.length]);
@@ -212,13 +215,13 @@ pub fn duplicateOnto(allocator: Allocator, src: *Object, dest: *Object) !void {
             // initialize new values
             var i: usize = 0;
             while (i < hash_map.count()) : (i += 1) {
-                try duplicateOnto(allocator, hash_map.keys()[i].asRef(), new_hash_map.keys()[i].asRef());
-                try duplicateOnto(allocator, hash_map.values()[i].asRef(), new_hash_map.values()[i].asRef());
+                try hash_map.keys()[i].duplicateOnto(allocator, &new_hash_map.keys()[i]);
+                try hash_map.values()[i].duplicateOnto(allocator, &new_hash_map.values()[i]);
             }
             errdefer {
                 for (0..i) |j| {
-                    freeInternals(allocator, new_hash_map.keys()[j].asRef());
-                    freeInternals(allocator, new_hash_map.values()[j].asRef());
+                    freeInternals(allocator, &new_hash_map.keys()[j]);
+                    freeInternals(allocator, &new_hash_map.values()[j]);
                 }
             }
 
@@ -227,32 +230,28 @@ pub fn duplicateOnto(allocator: Allocator, src: *Object, dest: *Object) !void {
         .custom_type => {
             src.body.custom_type.type_ptr.duplicate(allocator, src, dest);
         },
-        .string => {
-            // Make sure to update bytes pointer to new object's bytes
-            dest.body.string.bytes = dest.head.bytes;
-
-            dest.body.string.byte_length = src.body.string.byte_length;
-            dest.body.string.utf8_length = src.body.string.utf8_length;
-        },
-        .index, .return_code, .number, .float => {
-            dest.body.* = src.body.*;
+        .string, .index, .return_code, .number, .float => {
+            dest.body = src.body;
         },
         .none => {},
     }
 
-    dest.head.tag = src.head.tag;
+    dest.tag = src.tag;
 }
 
-pub fn duplicate(allocator: Allocator, src: *Object) !*Object {
+pub fn duplicate(src: *Object, allocator: Allocator) !*Object {
     const new_obj = try allocator.create(Object);
 
-    new_obj.head = .{
+    new_obj.* = .{
         .ref_count = 1,
-        .ref_counted = true,
-        .mutable = true,
+        .flags = .{
+            .ref_counted = true,
+            .mutable = true,
+        },
+        .body = undefined,
     };
 
-    try duplicateOnto(allocator, src, new_obj);
+    try src.duplicateOnto(allocator, new_obj);
     return new_obj;
 }
 
@@ -261,22 +260,22 @@ test "Object duplication" {
 
     // Number object
     var obj = init();
-    obj.head.tag = .number;
+    obj.tag = .number;
     obj.body.number = 10;
 
-    const new_obj = try duplicate(ta, obj.asRef());
-    defer release(ta, new_obj);
+    const new_obj = try obj.duplicate(ta);
+    defer new_obj.release(ta);
 
-    try expectEqual(.number, new_obj.head.tag);
+    try expectEqual(.number, new_obj.tag);
     try expectEqual(10, new_obj.body.number);
 
     // try borrowing
-    const borrowed = try borrow(ta, new_obj, false);
+    const borrowed = try new_obj.borrow(ta, false);
     try expectEqual(borrowed, new_obj);
-    try expectEqual(2, new_obj.head.ref_count);
+    try expectEqual(2, new_obj.ref_count);
 
-    release(ta, borrowed);
-    try expectEqual(1, new_obj.head.ref_count);
+    borrowed.release(ta);
+    try expectEqual(1, new_obj.ref_count);
 }
 
 pub const ObjectListRef = union(enum) {
@@ -286,13 +285,13 @@ pub const ObjectListRef = union(enum) {
     pub fn get(self: *ObjectListRef, index: usize) *Object {
         switch (self.*) {
             .normal => |list| {
-                return list.elements[0..list.length][index].asRef();
+                return &list.elements[0..list.length][index];
             },
             .dictionary => |dict| {
                 if (@rem(index, 2) == 0) {
-                    return dict.keys()[index / 2].asRef();
+                    return &dict.keys()[index / 2];
                 } else {
-                    return dict.values()[index / 2].asRef();
+                    return &dict.values()[index / 2];
                 }
             },
         }
@@ -322,7 +321,7 @@ fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
 
     var total_length: usize = 0;
     for (0..list.length()) |i| {
-        const element_string = try getString(allocator, list.get(i));
+        const element_string = try list.get(i).getString(allocator);
         quoting_types[i] = string_utils.calculateNeededQuotingType(element_string);
         if (i == 0 and quoting_types[i] == .bare and
             element_string.len > 0 and element_string[0] == '#')
@@ -339,7 +338,7 @@ fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
     var written: usize = 0;
 
     for (0..list.length()) |i| {
-        const element_string = try getString(allocator, list.get(i));
+        const element_string = try list.get(i).getString(allocator);
         written += string_utils.quoteString(
             quoting_types[i],
             element_string,
@@ -365,7 +364,7 @@ fn getListString(allocator: Allocator, list: *ObjectListRef) ![:0]u8 {
     return finished_str[0..(written - 1) :0];
 }
 
-pub fn getString(allocator: Allocator, obj: *Object) Allocator.Error![:0]u8 {
+pub fn getString(obj: *Object, allocator: Allocator) Allocator.Error![:0]u8 {
     // Check if it already has a string representation
     if (obj.bytes) |bytes| {
         return bytes[0..obj.length :0];
@@ -415,20 +414,20 @@ test "Get string" {
     const ta = std.testing.allocator;
 
     var obj = init();
-    obj.head.tag = .number;
+    obj.tag = .number;
     obj.body.number = 10;
-    defer freeInternals(ta, obj.asRef());
+    defer obj.freeInternals(ta);
 
-    try expectEqualSlices(u8, "10", try getString(ta, obj.asRef()));
+    try expectEqualSlices(u8, "10", try obj.getString(ta));
 }
 
 /// Frees the string and body
-pub fn freeInternals(alloc: Allocator, obj: *Object) void {
-    invalidateString(alloc, obj);
-    invalidateBody(alloc, obj);
+pub fn freeInternals(obj: *Object, alloc: Allocator) void {
+    obj.invalidateString(alloc);
+    obj.invalidateBody(alloc);
 }
 
-pub fn invalidateString(allocator: Allocator, obj: *Object) void {
+pub fn invalidateString(obj: *Object, allocator: Allocator) void {
     if (obj.bytes) |bytes| {
         allocator.free(bytes[0..obj.length :0]);
         obj.bytes = null;
@@ -437,7 +436,7 @@ pub fn invalidateString(allocator: Allocator, obj: *Object) void {
 
 /// Caller is responsible for syncing the body contents
 /// across threads before calling.
-pub fn invalidateBody(alloc: Allocator, obj: *Object) void {
+pub fn invalidateBody(obj: *Object, alloc: Allocator) void {
     if (obj.tag == .none) return; // nothing to do
 
     switch (obj.tag) {
@@ -445,7 +444,7 @@ pub fn invalidateBody(alloc: Allocator, obj: *Object) void {
             const list = obj.body.list;
 
             for (0..list.length) |i| {
-                freeInternals(alloc, list.elements[i].asRef());
+                list.elements[i].freeInternals(alloc);
             }
 
             alloc.free(list.elements[0..list.capacity]);
@@ -456,8 +455,8 @@ pub fn invalidateBody(alloc: Allocator, obj: *Object) void {
             // Be sure to free the keys and values before freeing the container
             var iter = hash_map.iterator();
             while (iter.next()) |entry| {
-                freeInternals(alloc, entry.key_ptr.asRef());
-                freeInternals(alloc, entry.value_ptr.asRef());
+                entry.key_ptr.freeInternals(alloc);
+                entry.value_ptr.freeInternals(alloc);
             }
 
             hash_map.deinit(alloc);
