@@ -9,17 +9,62 @@ const Allocator = std.mem.Allocator;
 
 const FreeList = std.ArrayListUnmanaged(usize);
 
+// These functions are all used for appending to the free list (it should have
+// already resized itself)
+fn null_alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    _ = ctx;
+    _ = n;
+    _ = alignment;
+    _ = ra;
+    @panic("Alloc called on null allocator");
+}
+fn null_resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_size: usize, return_address: usize) bool {
+    _ = ctx;
+    _ = buf;
+    _ = alignment;
+    _ = new_size;
+    _ = return_address;
+    @panic("Resize called on null allocator");
+}
+fn null_remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+    _ = context;
+    _ = memory;
+    _ = alignment;
+    _ = new_len;
+    _ = return_address;
+    @panic("Remap called on null allocator");
+}
+fn null_free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+    _ = ctx;
+    _ = buf;
+    _ = alignment;
+    _ = return_address;
+    @panic("Free called on null allocator");
+}
+var null_ctx: usize = 0;
+const null_allocator: Allocator = .{
+    .ptr = &null_ctx,
+    .vtable = &.{
+        .alloc = null_alloc,
+        .resize = null_resize,
+        .remap = null_remap,
+        .free = null_free,
+    },
+};
+
 /// Dependant on parent allocator to resize the internal free lists
 pub fn BuddyUnmanaged(max_order: comptime_int) type {
     return struct {
         // TODO: make this one data structure
         free_lists: [max_order]FreeList,
+        alloc_count: [max_order]usize,
 
         const Self = @This();
 
         pub fn init(allocator: Allocator, initial_capacity: usize) error{OutOfMemory}!Self {
             var new_alloc: Self = .{
                 .free_lists = undefined,
+                .alloc_count = [_]usize{0} ** max_order,
             };
 
             for (0..max_order) |i| {
@@ -38,6 +83,13 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
         }
 
         pub fn alloc(self: *Self, allocator: Allocator, requested_order: u6) error{OutOfMemory}!usize {
+            // Ensure that the free list has enough space when the object needs to be freed
+            try self.free_lists[requested_order].ensureTotalCapacity(
+                allocator,
+                (self.alloc_count[requested_order] + 1) / 2 + 1,
+            );
+            self.alloc_count[requested_order] += 1;
+
             // look for an open block
             var open_index: usize = undefined;
             var open_order = requested_order;
@@ -58,45 +110,75 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             return open_index;
         }
 
-        pub fn free(self: *Self, allocator: Allocator, index: usize, order: u6) error{OutOfMemory}!void {
+        pub fn free(self: *Self, index: usize, order: u6) void {
+            std.debug.print("Freeing {} (order {})\n", .{ index, order });
             // TODO: add safety check that the allocation exists before freeing it
 
+            // If this block has a buddy, merge. If not, add this block to the appropriate free list.
+            const freed_buddy = buddy_of(index, get_order_size(order));
+            var buddy_free_list_index: usize = undefined;
+            for (self.free_lists[order].items, 0..) |block, i| {
+                if (block == freed_buddy) {
+                    buddy_free_list_index = i;
+                    break;
+                }
+            } else {
+                self.free_lists[order].append(null_allocator, index) catch unreachable;
+                std.debug.print(
+                    "No buddy of {} (order {}). Adding to free list.\n",
+                    .{ index, order },
+                );
+                return; // No buddy, return.
+            }
+
+            // This block has a buddy, so do recursive merging.
             var order_being_merged = order;
             var block_being_merged = index;
+            var buddy_being_merged = freed_buddy;
+
+            std.debug.print("Found buddy {}\n", .{freed_buddy});
 
             // Why `< max_order - 1`? Because the top order has no sibling to merge with.
-            while (order_being_merged < max_order - 1) : (order_being_merged += 1) {
-                const sibling = sibling_of(block_being_merged, get_order_size(order_being_merged));
+            while (order_being_merged < max_order - 1) {
+                self.print_buddy_state("");
+                std.debug.print("Removing {} (order {})\n", .{
+                    self.free_lists[order_being_merged].items[buddy_free_list_index],
+                    order,
+                });
+                // Remove buddy from its free list (no longer free since it's being merged)
+                _ = self.free_lists[order_being_merged].swapRemove(buddy_free_list_index);
+                // No need to remove the block, since we never added it in the first place
 
-                std.debug.print(
-                    "Order: {}, block: {}, sibling: {}\n",
-                    .{ order_being_merged, block_being_merged, sibling },
-                );
+                // We've effectively merged the two blocks now, but we're not going to put
+                // the merged result on the higher free list, because it'll be passed up
+                // through block_being_merged anyways. We do however need to update the index,
+                // because the higher order is aligned differently.
+                order_being_merged += 1;
+                block_being_merged = @min(block_being_merged, buddy_being_merged);
 
-                var index_in_free_list: usize = undefined;
+                // Now check if the higher order block also needs to be merged, by checking
+                // for the presence of its buddy in the free list.
+
+                // Search for its buddy.
+                buddy_being_merged = buddy_of(block_being_merged, get_order_size(order_being_merged));
                 for (self.free_lists[order_being_merged].items, 0..) |block, i| {
-                    if (block == sibling) {
-                        index_in_free_list = i;
+                    if (block == buddy_being_merged) {
+                        buddy_free_list_index = i;
                         break;
                     }
                 } else {
-                    // Couldn't find sibling, so we'll put this one on the
-                    // free list.
-                    try self.free_lists[order].append(allocator, index);
+                    self.free_lists[order_being_merged].append(
+                        null_allocator,
+                        block_being_merged,
+                    ) catch unreachable;
                     return;
                 }
 
-                // We've found the sibling, so now we can merge.
-
-                // Remove sibling from free list
-                _ = self.free_lists[order_being_merged].swapRemove(index_in_free_list);
-
-                block_being_merged = @min(block_being_merged, sibling);
-                try self.free_lists[order_being_merged + 1].append(allocator, block_being_merged);
+                // We've found the sibling, so the next iteration will merge.
             }
         }
 
-        fn sibling_of(index: usize, order_size: usize) usize {
+        fn buddy_of(index: usize, order_size: usize) usize {
             const mask = (order_size * 2) - 1;
 
             if (index & mask == 0) {
@@ -109,6 +191,14 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
         fn get_order_size(order: u6) usize {
             return @as(usize, 1) << order;
         }
+
+        fn print_buddy_state(self: Self, beginning: []const u8) void {
+            std.debug.print("{s}", .{beginning});
+            for (0..self.free_lists.len) |order| {
+                std.debug.print("Order: {} ({any}), ", .{ order, self.free_lists[order].items });
+            }
+            std.debug.print("\n", .{});
+        }
     };
 }
 
@@ -116,13 +206,6 @@ const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 
 const TestAlloc = BuddyUnmanaged(5);
-fn print_buddy_state(beginning: []const u8, alloc: TestAlloc) void {
-    std.debug.print("{s}", .{beginning});
-    for (0..alloc.free_lists.len) |order| {
-        std.debug.print("Order: {} ({any}), ", .{ order, alloc.free_lists[order].items });
-    }
-    std.debug.print("\n", .{});
-}
 
 test "Buddy allocator" {
     const ta = std.testing.allocator;
@@ -130,37 +213,38 @@ test "Buddy allocator" {
     var alloc = try TestAlloc.init(ta, 16);
     defer alloc.deinit(ta);
 
-    print_buddy_state("0. ", alloc);
+    alloc.print_buddy_state("0. ");
     try expectEqual(0, try alloc.alloc(ta, 0));
-    print_buddy_state("1. ", alloc);
+    alloc.print_buddy_state("1. ");
     try expectEqual(1, try alloc.alloc(ta, 0));
-    print_buddy_state("2. ", alloc);
+    alloc.print_buddy_state("2. ");
     try expectEqual(2, try alloc.alloc(ta, 0));
-    print_buddy_state("3. ", alloc);
+    alloc.print_buddy_state("3. ");
 
     try expectEqual(4, try alloc.alloc(ta, 1));
-    print_buddy_state("4. ", alloc);
+    alloc.print_buddy_state("4. ");
     try expectEqual(3, try alloc.alloc(ta, 0));
-    print_buddy_state("5. ", alloc);
+    alloc.print_buddy_state("5. ");
 
     try expectEqual(8, try alloc.alloc(ta, 3));
+    alloc.print_buddy_state("6. ");
 
-    //
-    print_buddy_state("\n6. ", alloc);
-    try alloc.free(ta, 0, 0);
-    print_buddy_state("7. ", alloc);
-    try alloc.free(ta, 1, 0);
-    print_buddy_state("8. ", alloc);
-    try alloc.free(ta, 2, 0);
-    print_buddy_state("9. ", alloc);
+    // --- //
+    alloc.print_buddy_state("\n7. ");
+    alloc.free(0, 0);
+    alloc.print_buddy_state("\n8. ");
+    alloc.free(1, 0);
+    alloc.print_buddy_state("\n9. ");
+    alloc.free(2, 0);
+    alloc.print_buddy_state("\n10. ");
 
-    try alloc.free(ta, 4, 1);
-    print_buddy_state("10. ", alloc);
-    try alloc.free(ta, 3, 0);
-    print_buddy_state("11. ", alloc);
+    alloc.free(4, 1);
+    alloc.print_buddy_state("\n11. ");
+    alloc.free(3, 0);
+    alloc.print_buddy_state("\n12. ");
 
-    try alloc.free(ta, 8, 3);
-    print_buddy_state("12. ", alloc);
+    alloc.free(8, 3);
+    alloc.print_buddy_state("\n13. ");
 
     try expectEqual(0, try alloc.alloc(ta, 3));
 }
