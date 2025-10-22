@@ -88,9 +88,10 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
                 allocator,
                 (self.alloc_count[requested_order] + 1) / 2 + 1,
             );
-            self.alloc_count[requested_order] += 1;
+            self.alloc_count[requested_order] += 1; // Allocation stats.
 
-            // look for an open block
+            // look for an open block of any size >= requested_order (if the open block
+            // is too big, we'll split it).
             var open_index: usize = undefined;
             var open_order = requested_order;
             while (open_order < max_order) : (open_order += 1) {
@@ -111,7 +112,8 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
         }
 
         pub fn free(self: *Self, index: usize, order: u6) void {
-            // TODO: add safety check that the allocation exists before freeing it
+            // TODO: add safety check that the allocation exists before freeing it.
+            self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
             const freed_buddy = buddy_of(index, get_order_size(order));
@@ -155,6 +157,8 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
                         break;
                     }
                 } else {
+                    // In this case, we actually _do_ need to append the merged block,
+                    // since we're no longer implicitly passing it up `block_being_merged`.
                     self.free_lists[order_being_merged].append(
                         null_allocator,
                         block_being_merged,
