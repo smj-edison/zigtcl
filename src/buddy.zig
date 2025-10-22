@@ -111,7 +111,6 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
         }
 
         pub fn free(self: *Self, index: usize, order: u6) void {
-            std.debug.print("Freeing {} (order {})\n", .{ index, order });
             // TODO: add safety check that the allocation exists before freeing it
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
@@ -124,10 +123,6 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
                 }
             } else {
                 self.free_lists[order].append(null_allocator, index) catch unreachable;
-                std.debug.print(
-                    "No buddy of {} (order {}). Adding to free list.\n",
-                    .{ index, order },
-                );
                 return; // No buddy, return.
             }
 
@@ -136,15 +131,8 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             var block_being_merged = index;
             var buddy_being_merged = freed_buddy;
 
-            std.debug.print("Found buddy {}\n", .{freed_buddy});
-
             // Why `< max_order - 1`? Because the top order has no sibling to merge with.
             while (order_being_merged < max_order - 1) {
-                self.print_buddy_state("");
-                std.debug.print("Removing {} (order {})\n", .{
-                    self.free_lists[order_being_merged].items[buddy_free_list_index],
-                    order,
-                });
                 // Remove buddy from its free list (no longer free since it's being merged)
                 _ = self.free_lists[order_being_merged].swapRemove(buddy_free_list_index);
                 // No need to remove the block, since we never added it in the first place
@@ -204,6 +192,7 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
 
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
+const expectEqualSlices = std.testing.expectEqualSlices;
 
 const TestAlloc = BuddyUnmanaged(5);
 
@@ -213,38 +202,30 @@ test "Buddy allocator" {
     var alloc = try TestAlloc.init(ta, 16);
     defer alloc.deinit(ta);
 
-    alloc.print_buddy_state("0. ");
     try expectEqual(0, try alloc.alloc(ta, 0));
-    alloc.print_buddy_state("1. ");
     try expectEqual(1, try alloc.alloc(ta, 0));
-    alloc.print_buddy_state("2. ");
     try expectEqual(2, try alloc.alloc(ta, 0));
-    alloc.print_buddy_state("3. ");
 
     try expectEqual(4, try alloc.alloc(ta, 1));
-    alloc.print_buddy_state("4. ");
     try expectEqual(3, try alloc.alloc(ta, 0));
-    alloc.print_buddy_state("5. ");
 
     try expectEqual(8, try alloc.alloc(ta, 3));
-    alloc.print_buddy_state("6. ");
 
     // --- //
-    alloc.print_buddy_state("\n7. ");
     alloc.free(0, 0);
-    alloc.print_buddy_state("\n8. ");
     alloc.free(1, 0);
-    alloc.print_buddy_state("\n9. ");
     alloc.free(2, 0);
-    alloc.print_buddy_state("\n10. ");
 
     alloc.free(4, 1);
-    alloc.print_buddy_state("\n11. ");
     alloc.free(3, 0);
-    alloc.print_buddy_state("\n12. ");
 
     alloc.free(8, 3);
-    alloc.print_buddy_state("\n13. ");
 
-    try expectEqual(0, try alloc.alloc(ta, 3));
+    // Ensure the allocator is back to how it started
+    try expectEqual(0, alloc.free_lists[0].items.len);
+    try expectEqual(0, alloc.free_lists[1].items.len);
+    try expectEqual(0, alloc.free_lists[2].items.len);
+    try expectEqual(0, alloc.free_lists[3].items.len);
+    try expectEqual(1, alloc.free_lists[4].items.len);
+    try expectEqual(0, alloc.free_lists[4].items[0]);
 }
