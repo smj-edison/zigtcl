@@ -1,24 +1,26 @@
-//! Simple buddy allocator for any collection type.
+//! Memory-related functions and objects.
 //!
-//! Based on https://www.kernel.org/doc/gorman/html/understand/understand009.html
+//! Buddy allocator based on https://www.kernel.org/doc/gorman/html/understand/understand009.html
 
 const std = @import("std");
 const math = std.math;
+const heap = std.heap;
+const mem = std.mem;
 const assert = std.debug.assert;
-const Allocator = std.mem.Allocator;
+const Allocator = mem.Allocator;
 
 const FreeList = std.ArrayListUnmanaged(usize);
 
-// These functions are all used for appending to the free list (it should have
+// These functions are all when appending to the free list (it should have
 // already resized itself)
-fn null_alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+fn null_alloc(ctx: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*]u8 {
     _ = ctx;
     _ = n;
     _ = alignment;
     _ = ra;
     @panic("Alloc called on null allocator");
 }
-fn null_resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_size: usize, return_address: usize) bool {
+fn null_resize(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, new_size: usize, return_address: usize) bool {
     _ = ctx;
     _ = buf;
     _ = alignment;
@@ -26,7 +28,7 @@ fn null_resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_siz
     _ = return_address;
     @panic("Resize called on null allocator");
 }
-fn null_remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+fn null_remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
     _ = context;
     _ = memory;
     _ = alignment;
@@ -34,7 +36,7 @@ fn null_remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n
     _ = return_address;
     @panic("Remap called on null allocator");
 }
-fn null_free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+fn null_free(ctx: *anyopaque, buf: []u8, alignment: mem.Alignment, return_address: usize) void {
     _ = ctx;
     _ = buf;
     _ = alignment;
@@ -42,7 +44,7 @@ fn null_free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, return_ad
     @panic("Free called on null allocator");
 }
 var null_ctx: usize = 0;
-const null_allocator: Allocator = .{
+pub const null_allocator: Allocator = .{
     .ptr = &null_ctx,
     .vtable = &.{
         .alloc = null_alloc,
@@ -51,6 +53,10 @@ const null_allocator: Allocator = .{
         .free = null_free,
     },
 };
+
+pub fn getOrder(count: usize) u6 {
+    return @intCast(math.log2_int_ceil(usize, count));
+}
 
 /// Dependant on parent allocator to resize the internal free lists
 pub fn BuddyUnmanaged(max_order: comptime_int) type {
@@ -82,6 +88,12 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             }
         }
 
+        pub fn allocCount(self: *Self, gpa: Allocator, count: usize) !usize {
+            assert(count > 0);
+            const order: u6 = @intCast(math.log2_int_ceil(usize, count));
+            return self.alloc(gpa, order);
+        }
+
         pub fn alloc(self: *Self, allocator: Allocator, requested_order: u6) error{OutOfMemory}!usize {
             // Ensure that the free list has enough space when the object needs to be freed
             try self.free_lists[requested_order].ensureTotalCapacity(
@@ -109,6 +121,12 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             }
 
             return open_index;
+        }
+
+        pub fn freeCount(self: *Self, index: usize, count: usize) void {
+            assert(count > 0);
+            const order: u6 = @intCast(math.log2_int_ceil(usize, count));
+            return self.free(index, order);
         }
 
         pub fn free(self: *Self, index: usize, order: u6) void {
@@ -232,4 +250,27 @@ test "Buddy allocator" {
     try expectEqual(0, alloc.free_lists[3].items.len);
     try expectEqual(1, alloc.free_lists[4].items.len);
     try expectEqual(0, alloc.free_lists[4].items[0]);
+}
+
+pub fn vmemMap(comptime T: type, count: usize) ![]align(heap.page_size_min) u8 {
+    const byte_count = @sizeOf(T) * count;
+    const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(heap.page_size_min)) orelse return error.OutOfMemory;
+
+    return @alignCast(mapped[0..byte_count]);
+}
+
+pub fn vmemUnmap(memory: []align(heap.page_size_min) u8) void {
+    heap.PageAllocator.unmap(memory);
+}
+
+test "Virtual memory" {
+    var array = try vmemMap(usize, 5);
+    array[0] = 5;
+    array[1] = 10;
+    vmemUnmap(array);
+
+    array = try vmemMap(usize, 1 << 32);
+    array[1 << 20] = 5;
+    array[1 << 30] = 10;
+    vmemUnmap(array);
 }

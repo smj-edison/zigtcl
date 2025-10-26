@@ -554,7 +554,7 @@ fn testEscape(alloc: *std.mem.Allocator, expected: []const u8, to_escape: []cons
 }
 
 pub const QuotingType = enum(u8) { bare, brace, escape };
-pub fn calculateNeededQuotingType(str: []u8) QuotingType {
+pub fn calculateNeededQuotingType(str: []const u8) QuotingType {
     // Empty string needs to be represented in braces
     if (str.len == 0) return QuotingType.brace;
 
@@ -668,7 +668,7 @@ pub fn quoteSize(quoting_type: QuotingType, str_len: usize) usize {
 }
 
 /// Returns the amount written to dest
-pub fn quoteString(quoting_type: QuotingType, src: []u8, dest: []u8, escape_first_pound: bool) usize {
+pub fn quoteString(quoting_type: QuotingType, src: []const u8, dest: []u8, escape_first_pound: bool) usize {
     switch (quoting_type) {
         .bare => {
             @memmove(dest, src);
