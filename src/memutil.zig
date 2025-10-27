@@ -252,8 +252,7 @@ test "Buddy allocator" {
     try expectEqual(0, alloc.free_lists[4].items[0]);
 }
 
-pub fn vmemMap(comptime T: type, count: usize) ![]align(heap.page_size_min) u8 {
-    const byte_count = @sizeOf(T) * count;
+pub fn vmemMap(byte_count: usize) ![]align(heap.page_size_min) u8 {
     const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(heap.page_size_min)) orelse return error.OutOfMemory;
 
     return @alignCast(mapped[0..byte_count]);
@@ -261,6 +260,20 @@ pub fn vmemMap(comptime T: type, count: usize) ![]align(heap.page_size_min) u8 {
 
 pub fn vmemUnmap(memory: []align(heap.page_size_min) u8) void {
     heap.PageAllocator.unmap(memory);
+}
+
+pub fn vmemMapItems(comptime T: type, count: usize) ![]align(heap.page_size_min) T {
+    const byte_count = @sizeOf(T) * count;
+    const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(@alignOf(T))) orelse return error.OutOfMemory;
+    const items: [*]T = @ptrCast(mapped);
+
+    return items[0..count];
+}
+
+pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) void {
+    const byte_count = items.len * @sizeOf(T);
+    const bytes: [*]u8 = @ptrCast(items.ptr);
+    heap.PageAllocator.unmap(bytes[0..byte_count]);
 }
 
 test "Virtual memory" {

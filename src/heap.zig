@@ -18,17 +18,19 @@ const global_heap_id = 0;
 
 pub const HeapSettings = struct {
     /// threading only works on 64-bit machines, because
-    /// the object heads are atomically swapped
+    /// the object heads are atomically swapped.
     threading: bool = true,
     use_vmem: bool = true,
     /// Maximum of `1 << heap_order` items.
     object_heap_order: u6 = 24,
-    /// Maximum of `1 << heap_order` bytes for all strings
+    /// Maximum of `1 << heap_order` bytes for all strings.
     string_heap_order: u6 = 28,
-    /// Maximum number of custom types
+    /// Maximum number of custom types.
     max_custom_types: usize = 65536,
-    /// Maximum number of heaps (not necessarily initialized)
+    /// Maximum number of heaps (not necessarily initialized).
     max_heaps: usize = 128,
+    /// Maximum number of custom type instances.
+    max_custom_type_instances: u32 = 65536,
 };
 const cfg: HeapSettings = .{};
 
@@ -48,6 +50,7 @@ object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
+type_instances: CustomTypeInstanceList,
 
 const Object = packed struct {
     pub const StrOrPtr = packed struct {
@@ -56,7 +59,7 @@ const Object = packed struct {
                 index: u32,
                 length: u26,
             },
-            /// Be sure to >> 6 before setting, and << 6 when reading
+            /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
             ptr: u58,
         },
         is_ptr: bool,
@@ -68,9 +71,10 @@ const Object = packed struct {
 
     fn hasNullString(self: Object) bool {
         if (self.str.is_ptr) {
-            return self.str.u.ptr == 0;
+            return false;
         } else {
-            return self.str.u.str.index == 0;
+            // Must check length too, as tiny strings use a null index but non-zero length
+            return self.str.u.str.index == 0 and self.str.u.str.length == 0;
         }
     }
 };
@@ -85,6 +89,7 @@ pub const Tag = enum(u5) {
     return_code,
     number,
     float,
+    /// `.tiny_string` _must_ have at least one byte (e.g. not null and not empty)
     tiny_string,
     string,
     list,
@@ -130,7 +135,7 @@ pub const CustomType = struct {
     make_immutable: *const fn (heap: *Heap, obj: *Object) void,
 };
 
-const Handle = packed struct {
+pub const Handle = packed struct {
     index: u32,
     heap: u30,
     /// Whether this object can be ref counted (else it needs to be cloned)
@@ -139,7 +144,7 @@ const Handle = packed struct {
 };
 
 const HeapError = error{WrongHeap};
-const HeapId = u30;
+pub const HeapId = u30;
 
 const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
 
@@ -147,6 +152,22 @@ const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
 const ObjectList = std.MultiArrayList(ObjectAndMetadata);
 const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
 const StringList = std.ArrayList(u8);
+const CustomTypeInstance = *anyopaque;
+const CustomTypeInstanceList = std.ArrayList(CustomTypeInstance);
+
+const ObjectAndMetadata = struct {
+    object: Object,
+    ref_count: u32,
+    metadata: packed struct {
+        order: u6,
+        /// Whether this object is the front of the allocation
+        /// (if not, this index will not be freed, as it's
+        /// managed by another object)
+        is_alloc_head: bool,
+        /// Whether this object is shared across threads
+        cross_thread: bool,
+    },
+};
 
 fn heapAlloc(self: *Heap) Allocator {
     if (cfg.use_vmem or cfg.threading) {
@@ -157,12 +178,13 @@ fn heapAlloc(self: *Heap) Allocator {
 }
 
 pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
+    // Init objects
     var object_tracking = try ObjectTracker.init(gpa, cfg.object_heap_order);
     errdefer object_tracking.deinit(gpa);
 
     var objects: ObjectList = .{};
     if (cfg.use_vmem) {
-        objects.bytes = (try memutil.vmemMap(Object, object_heap_max_bytes)).ptr;
+        objects.bytes = (try memutil.vmemMap(object_heap_max_bytes)).ptr;
         objects.capacity = object_heap_max_count;
     } else if (cfg.threading) {
         // if multithreading, we can't have objects moving around. We better allocate
@@ -179,12 +201,13 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         }
     }
 
+    // Init strings
     var string_tracking = try StringTracker.init(gpa, 32);
     errdefer string_tracking.deinit(gpa);
 
     var strings: StringList = .{};
     if (cfg.use_vmem) {
-        strings.items = try memutil.vmemMap(u8, string_heap_max_bytes);
+        strings.items = try memutil.vmemMap(string_heap_max_bytes);
     } else if (cfg.threading) {
         // if multithreading, we can't have strings moving around. We better allocate
         // everything up front.
@@ -192,8 +215,26 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     } else {
         try strings.ensureTotalCapacity(gpa, 32);
     }
-    errdefer strings.deinit(gpa);
+    errdefer if (cfg.use_vmem) memutil.vmemUnmap(strings.items) else strings.deinit(gpa);
 
+    // Init type instances
+    var type_instances: CustomTypeInstanceList = .{};
+    if (cfg.use_vmem) {
+        type_instances.items = try memutil.vmemMapItems(CustomTypeInstance, cfg.max_custom_type_instances);
+    } else if (cfg.threading) {
+        // if multithreading, we can't have strings moving around. We better allocate
+        // everything up front.
+        try type_instances.ensureTotalCapacity(gpa, cfg.max_custom_type_instances);
+    } else {
+        try type_instances.ensureTotalCapacity(gpa, 32);
+    }
+    errdefer if (cfg.use_vmem) {
+        memutil.vmemUnmapItems(CustomTypeInstance, type_instances.items);
+    } else {
+        type_instances.deinit(gpa);
+    };
+
+    // Create heap
     var heap = Heap{
         .gpa = gpa,
         .heap_id = heap_id,
@@ -201,8 +242,10 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         .objects = objects,
         .string_tracking = string_tracking,
         .strings = strings,
+        .type_instances = type_instances,
     };
 
+    // Specialty objects
     // null object is guaranteed to have index 0
     const null_object = try heap.createObject();
     assert(null_object.index == 0);
@@ -221,6 +264,7 @@ pub fn deinit(self: *Heap) void {
     if (cfg.use_vmem) {
         memutil.vmemUnmap(@alignCast(self.strings.items));
         memutil.vmemUnmap(@alignCast(self.objects.bytes[0..self.objects.capacity]));
+        memutil.vmemUnmapItems(CustomTypeInstance, self.type_instances.items);
     } else {
         // Don't use self.heapAlloc() in this case, as that will error
         // with the null allocator
@@ -300,14 +344,25 @@ fn freeLocalObject(self: *Heap, index: u32) void {
     }
 }
 
+pub fn invalidateString(handle: Handle) void {
+    heaps[handle.index].invalidateLocalString(handle.index);
+}
+
+pub fn invalidateBody(handle: Handle) void {
+    heaps[handle.index].invalidateLocalBody(handle.index);
+}
+
 fn invalidateLocalString(self: *Heap, index: u32) void {
     const obj: *Object = &self.objects.items(.object)[index];
 
-    if (obj.str.is_ptr and obj.str.u.ptr != 0) {
-        LongString.fromInt(obj.str.u.ptr).decrRefCount();
-    } else if (!obj.str.is_ptr and obj.str.u.str.index > 1) {
-        // Why ` > 1`? because it excludes all special string types
-        self.freeString(obj.str.u.str.index, obj.str.u.str.length);
+    switch (self.getLocalStringDetails(index)) {
+        .long => |long_str| {
+            long_str.decrRefCount();
+        },
+        .normal => {
+            self.freeString(obj.str.u.str.index, obj.str.u.str.length);
+        },
+        .null, .empty, .tiny => {},
     }
 
     // Be sure to mark as having no string
@@ -408,69 +463,41 @@ pub fn release(self: *Heap, handle: Handle) void {
     }
 }
 
-fn duplicateObjString(self: *Heap, obj: *const Object) !Object {
-    // Easy case: tiny string
-    if (obj.tag == .tiny_string) {
-        return .{
-            .str = obj.str,
-            .tag = .tiny_string,
-            .body = obj.body,
-        };
-    }
-
-    // Another easy case: it doesn't have a string (null id or ptr)
-    if (obj.hasNullString()) {
-        return .{
-            .str = .{
-                .u = .{ .str = .{ .index = 0, .length = 0 } },
-                .is_ptr = false,
-            },
-            .tag = undefined,
-            .body = undefined,
-        };
-    }
-
-    if (obj.str.is_ptr) {
-        // Reconstruct the pointer
-        const long_string = LongString.fromInt(obj.str.u.ptr);
-        long_string.incrRefCount();
-
-        return .{
-            .str = .{
-                .u = .{ .ptr = obj.str.u.ptr },
+fn duplicateObjString(self: *Heap, index: u32) !Object.StrOrPtr {
+    switch (self.getLocalStringDetails(index)) {
+        .long => |long_str| {
+            long_str.incrRefCount();
+            return .{
+                .u = .{ .ptr = LongString.toInt(long_str) },
                 .is_ptr = true,
-            },
-            .tag = undefined,
-            .body = undefined,
-        };
-    } else {
-        // duplicate the string
-        const old_string = obj.str.u.str;
-        const new_string = if (old_string.length > 0) try self.createString(old_string.length) else empty_string;
+            };
+        },
+        .normal => |bytes| {
+            const new_string = try self.createString(bytes.len);
+            @memcpy(self.strings.items[new_string..(new_string + bytes.length) :0], bytes);
 
-        @memcpy(
-            self.strings.items[new_string..(new_string + old_string.length) :0],
-            self.strings.items[old_string.index..(old_string.index + old_string.length) :0],
-        );
-
-        return .{
-            .str = .{
-                .u = .{ .str = .{ .index = new_string, .length = old_string.length } },
+            return .{
+                .u = .{ .str = .{ .index = new_string, .length = bytes.length } },
                 .is_ptr = false,
-            },
-            .tag = undefined,
-            .body = undefined,
-        };
+            };
+        },
+        .tiny, .null, .empty => {
+            // Caller is responsible to copy the tiny string
+            const obj = self.getLocalObject(index);
+            return obj.str;
+        },
     }
 }
 
-fn duplicateSingle(self: *Heap, src: *const Object) !Object {
+fn duplicateSingle(self: *Heap, index: u32) !Object {
+    const src = self.getLocalObject(index);
     switch (src.tag) {
         .none, .index, .return_code, .number, .float, .string, .tiny_string => {
-            var new_object = try self.duplicateObjString(src);
-            new_object.tag = src.tag;
-            new_object.body = src.body;
-            return new_object;
+            return .{
+                .str = try self.duplicateObjString(src),
+                .tag = src.tag,
+                .body = src.body,
+            };
         },
         .reference => {
             const ref = src.body.reference;
@@ -487,7 +514,15 @@ fn duplicateSingle(self: *Heap, src: *const Object) !Object {
         .custom_type => {
             const custom_type = src.body.custom_type;
 
-            var new_object = try self.duplicateObjString(src);
+            var new_object: Object = .{
+                .str = try self.duplicateObjString(index),
+                .tag = .custom_type,
+                .body = .{
+                    .custom_type = .{
+                        .index = self.createCustomTypeInstance(),
+                    },
+                },
+            };
             custom_types[custom_type.type_id].duplicate(self, src, &new_object);
 
             return new_object;
@@ -554,17 +589,121 @@ pub fn normalHandle(self: *Heap, index: u32) Handle {
 }
 
 pub fn peek(handle: Handle) *Object {
-    return &heaps[handle.heap].objects.items(.object)[handle.index];
+    return &heaps[handle.heap].getLocalObject(handle.index);
+}
+
+fn getLocalObject(self: *Heap, index: u32) *Object {
+    return self.objects.items(.object)[index];
 }
 
 pub fn getString(handle: Handle) ![:0]const u8 {
     return try heaps[handle.heap].getLocalString(handle.index);
 }
 
+/// Copies provided string.
+pub fn setString(handle: Handle, bytes: [:0]const u8) !void {
+    const heap = heaps[handle.heap];
+    const new_str = try heap.gpa.dupeZ(u8, bytes);
+    errdefer heap.gpa.free(new_str);
+    const took_ownership = try heap.setLocalString(handle.index, new_str);
+    if (!took_ownership) heap.gpa.free(new_str);
+}
+
+/// Returns whether it took ownership of the bytes.
+fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
+    var took_ownership = false;
+
+    // Figure out the best way to represent the string (tiny string is not
+    // an option as the body is already occupied with another type)
+    var new_str_or_ptr: Object.StrOrPtr = undefined;
+    if (bytes.len == 0) {
+        new_str_or_ptr.u.str = .{
+            .index = empty_string,
+            .length = 0,
+        };
+        new_str_or_ptr.is_ptr = false;
+    } else if (bytes.len < LongString.split_point) {
+        const local_string = try self.createString(@intCast(bytes.len));
+        @memcpy(
+            self.strings.items[local_string..(local_string + bytes.len) :0],
+            bytes,
+        );
+
+        new_str_or_ptr.u.str = .{
+            .index = local_string,
+            .length = @intCast(bytes.len),
+        };
+        new_str_or_ptr.is_ptr = false;
+    } else {
+        took_ownership = true;
+
+        const new_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
+        new_string.* = .{
+            .string = bytes,
+            .ref_count = 1,
+            .utf8_length = null,
+        };
+
+        new_str_or_ptr.u.ptr = LongString.toInt(new_string);
+        new_str_or_ptr.is_ptr = true;
+    }
+
+    const obj: *Object = &self.objects.items(.object)[index];
+    if (cfg.threading and self.objects.get(index).metadata.cross_thread) {
+        // Atomically swap only the first half of the object
+        if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
+        if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
+        if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
+
+        const str_all_mask: u64 = (1 << 59) - 1;
+        const str_data_mask: u64 = (1 << 58) - 1;
+
+        const object_head: *u64 = @ptrCast(obj);
+        var old_obj = @atomicLoad(u64, object_head, .monotonic);
+
+        while (true) {
+            // Is the string pointer not null?
+            if (old_obj & str_data_mask != 0) {
+                // Somebody else must've won this, so we'll use their string
+                if (new_str_or_ptr.is_ptr) {
+                    took_ownership = false;
+                    LongString.fromInt(new_str_or_ptr.u.ptr).freeUnchecked();
+                } else {
+                    const local_string = new_str_or_ptr.u.str;
+                    if (local_string.index > 1) {
+                        self.freeString(local_string.index, local_string.length);
+                    }
+                }
+
+                break;
+            }
+
+            // Preserve tag from old_obj
+            var new_obj = old_obj & ~str_all_mask;
+            const new_obj_str: u59 = @bitCast(new_str_or_ptr);
+            new_obj |= new_obj_str;
+
+            const res: ?u64 = @cmpxchgWeak(u64, object_head, old_obj, new_obj, .release, .acquire);
+
+            if (res) |winning_obj| {
+                old_obj = winning_obj;
+                continue;
+            } else {
+                // Successfully swapped
+                break;
+            }
+        }
+    } else {
+        obj.str = new_str_or_ptr;
+    }
+
+    return took_ownership;
+}
+
 const empty_string_value = "";
 /// This returns a temporary string. Whenever the object is modified, it
 /// may become invalid.
-pub fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
+fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = &self.objects.items(.object)[index];
 
     // Check if it already has a string representation
@@ -616,85 +755,8 @@ pub fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
     }
 
-    // Figure out the best way to represent the string (tiny string is not
-    // an option as the body is already occupied with another type)
-    var new_str_or_ptr: Object.StrOrPtr = undefined;
-    if (new_str.len == 0) {
-        new_str_or_ptr.u.str = .{
-            .index = empty_string,
-            .length = 0,
-        };
-        new_str_or_ptr.is_ptr = false;
-    } else if (new_str.len < LongString.split_point) {
-        const local_string = try self.createString(@intCast(new_str.len));
-        @memcpy(
-            self.strings.items[local_string..(local_string + new_str.len) :0],
-            new_str,
-        );
-        self.gpa.free(new_str);
-
-        new_str_or_ptr.u.str = .{
-            .index = local_string,
-            .length = @intCast(new_str.len),
-        };
-        new_str_or_ptr.is_ptr = false;
-    } else {
-        const new_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
-        new_string.* = .{
-            .string = new_str,
-            .ref_count = 1,
-            .utf8_length = null,
-        };
-
-        new_str_or_ptr.u.ptr = LongString.toInt(new_string);
-        new_str_or_ptr.is_ptr = true;
-    }
-
-    if (cfg.threading and self.objects.get(index).metadata.cross_thread) {
-        // Atomically swap only the first half of the object
-        if (@sizeOf(Object) - @sizeOf(Body) != 8) @compileError("Object head must be exactly 8 bytes");
-        if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
-        if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
-
-        const str_all_mask: u64 = (1 << 59) - 1;
-        const str_data_mask: u64 = (1 << 58) - 1;
-
-        const object_head: *u64 = @ptrCast(obj);
-        var old_obj = @atomicLoad(u64, object_head, .monotonic);
-
-        while (true) {
-            // Is the string pointer not null?
-            if (old_obj & str_data_mask != 0) {
-                // Somebody else must've won this, so we'll use their string
-                if (new_str_or_ptr.is_ptr) {
-                    LongString.fromInt(new_str_or_ptr.u.ptr).decrRefCount();
-                } else {
-                    const local_string = new_str_or_ptr.u.str;
-                    self.freeString(local_string.index, local_string.length);
-                }
-
-                // Rerun this function to figure out where the new string is
-                return self.getLocalString(index);
-            }
-
-            // Preserve tag from old_obj
-            var new_obj = old_obj & ~str_all_mask;
-            const new_obj_str: u59 = @bitCast(new_str_or_ptr);
-            new_obj |= new_obj_str;
-
-            const res: ?u64 = @cmpxchgWeak(u64, object_head, old_obj, new_obj, .release, .acquire);
-
-            if (res) |winning_obj| {
-                old_obj = winning_obj;
-                continue;
-            } else {
-                // Successfully swapped
-                break;
-            }
-        }
-    } else {
-        obj.str = new_str_or_ptr;
-    }
+    const took_ownership = try self.setLocalString(index, new_str);
+    if (!took_ownership) self.gpa.free(new_str);
 
     // Rerun this function to figure out where the new string is
     return self.getLocalString(index);
@@ -753,6 +815,49 @@ fn getListString(self: *Heap, index: u32, length: u32) ![:0]u8 {
     return finished_str[0..(written - 1) :0];
 }
 
+const StringDetails = union(enum) {
+    null: void,
+    empty: void,
+    tiny: [:0]const u8,
+    normal: [:0]const u8,
+    long: *LongString,
+};
+
+fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
+    const obj = self.getLocalObject(index);
+
+    // Tiny string optimization?
+    if (obj.tag == .tiny_string) {
+        // Tiny strings are guaranteed to have at least one byte,
+        // so not null, and not empty.
+        const as_bytes: *[7:0]u8 = @ptrCast(&obj.body.tiny_string.bytes);
+        return .{
+            .tiny = as_bytes[0..obj.str.u.str.length :0],
+        };
+    }
+
+    // Normal string or long string
+    if (obj.tag == .string) {
+        if (obj.str.is_ptr) {
+            // Convert to LongString ptr (guaranteed to be non-null)
+            return .{
+                .long = LongString.fromInt(obj.str.u.ptr),
+            };
+        } else {
+            const str = obj.str.u.str;
+            if (str.index == null_string) {
+                return .null;
+            } else if (str.index == empty_string) {
+                return .empty;
+            } else {
+                return .{
+                    .normal = &self.strings.items[str.index..(str.index + str.length)],
+                };
+            }
+        }
+    }
+}
+
 fn lockTracking(self: *Heap) void {
     if (self.heap_id == global_heap_id) self.tracking_mutex.lock();
 }
@@ -760,20 +865,6 @@ fn lockTracking(self: *Heap) void {
 fn unlockTracking(self: *Heap) void {
     if (self.heap_id == global_heap_id) self.tracking_mutex.unlock();
 }
-
-const ObjectAndMetadata = struct {
-    object: Object,
-    ref_count: u32,
-    metadata: packed struct {
-        order: u6,
-        /// Whether this object is the front of the allocation
-        /// (if not, this index will not be freed, as it's
-        /// managed by another object)
-        is_alloc_head: bool,
-        /// Whether this object is shared across threads
-        cross_thread: bool,
-    },
-};
 
 pub const LongString = struct {
     /// At what point should we switch to using a long string?
@@ -802,12 +893,20 @@ pub const LongString = struct {
         }
     }
 
-    pub fn decrRefCount(self: *align(align_amt) LongString) void {
+    pub fn decrRefCount(gpa: Allocator, self: *align(align_amt) LongString) void {
         if (cfg.threading) {
             _ = @atomicRmw(usize, &self.ref_count, .Sub, 1, .monotonic);
         } else {
             self.ref_count -= 1;
         }
+
+        if (self.ref_count == 0) {
+            self.freeUnchecked(gpa);
+        }
+    }
+
+    pub fn freeUnchecked(self: *align(align_amt) LongString, gpa: Allocator) void {
+        gpa.destroy(self);
     }
 };
 
@@ -833,9 +932,9 @@ pub const CustomTypes = struct {
 };
 
 // Heap instances //
-var heaps: [cfg.max_heaps]Heap = undefined;
+pub var heaps: [cfg.max_heaps]Heap = undefined;
 var next_open_heap: usize = 0;
-var custom_types: [cfg.max_custom_types]CustomType = undefined;
+pub var custom_types: [cfg.max_custom_types]CustomType = undefined;
 var next_open_type: usize = 0;
 
 pub fn createHeap(gpa: Allocator) !?*Heap {

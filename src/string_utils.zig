@@ -113,6 +113,24 @@ pub fn cpIndexAscii(str: []const u8, index: usize) ?usize {
 /// get the byte index based on codepoint index
 const cpIndex = if (use_utf8) cpIndexUtf8 else cpIndexAscii;
 
+fn codepointLengthAscii(str: []const u8) usize {
+    return str.len;
+}
+
+fn codepointLengthUtf8(str: []const u8) usize {
+    var len: usize = 0;
+
+    var iter = Iterator.init(str);
+    while (iter.next()) |_| {
+        len += 1;
+    }
+
+    return len;
+}
+
+/// Get the length of the string in codepoints
+pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthUtf8;
+
 test "codepoint index" {
     try expectEqual(cpIndex("hello", 3), 3);
     if (use_utf8) try expectEqual(cpIndex("⇧hello", 3), 5);
