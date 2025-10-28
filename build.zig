@@ -27,6 +27,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .fields = @as([]const []const u8, &.{
             "simple_uppercase_mapping",
+            "simple_lowercase_mapping",
+            "simple_titlecase_mapping",
         }),
     });
 

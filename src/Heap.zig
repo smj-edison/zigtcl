@@ -88,6 +88,7 @@ pub const Tag = enum(u5) {
     index,
     number,
     float,
+    bool,
     /// `.tiny_string` _must_ have at least one byte (e.g. not null and not empty)
     tiny_string,
     string,
@@ -109,7 +110,7 @@ pub const ListIndex = packed struct {
 
     pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) !usize {
         if (self.is_end) {
-            const idx = std.math.add(i33, self.u.end_offset + list_len) catch return error.BadIndex;
+            const idx = std.math.add(i33, self.u.end_offset, list_len -| 1) catch return error.BadIndex;
             if (idx < 0) return error.BadIndex;
             if (idx > list_len) return error.BadIndex;
             return @intCast(idx);
@@ -124,6 +125,7 @@ pub const Body = packed union {
     index: ListIndex,
     number: i64,
     float: f64,
+    bool: bool,
     string: packed struct {
         /// If = utf8_length > maxInt(u32), it means the length has not been determined
         utf8_length: u33,
@@ -650,13 +652,21 @@ pub fn getLocalObject(self: *Heap, index: u32) *Object {
     return &self.objects.items(.object)[index];
 }
 
+/// Guaranteed to be valid, barring OOM.
 pub fn getString(handle: Handle) ![:0]const u8 {
+    return try getHeap(handle).getLocalString(handle.index);
+}
+
+/// Get the string to modify (must not write any longer than current len).
+pub fn getStringMut(handle: Handle) ![:0]u8 {
     return try getHeap(handle).getLocalString(handle.index);
 }
 
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: [:0]const u8) !void {
     const heap = getHeap(handle);
+    // TODO optimize, we shouldn't copy the string twice (I
+    // probably need to redesign the `setLocalString` API)
     const new_str = try heap.gpa.dupeZ(u8, bytes);
     errdefer heap.gpa.free(new_str);
     const took_ownership = try heap.setLocalString(handle.index, new_str);
@@ -757,7 +767,7 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
 const empty_string_value = "";
 /// This returns a temporary string. Whenever the object is modified, it
 /// may become invalid.
-fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
+fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]u8 {
     const obj: *Object = &self.objects.items(.object)[index];
 
     switch (self.getLocalStringDetails(index)) {
@@ -869,8 +879,8 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 const StringDetails = union(enum) {
     null: void,
     empty: void,
-    tiny: [:0]const u8,
-    normal: [:0]const u8,
+    tiny: [:0]u8,
+    normal: [:0]u8,
     long: *align(LongString.align_amt) LongString,
 };
 

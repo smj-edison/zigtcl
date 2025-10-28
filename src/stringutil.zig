@@ -18,11 +18,35 @@ const StringFlags = packed struct(u32) {
 
 const Codepoint = if (use_utf8) u21 else u8;
 
+pub fn checkAllAscii(bytes: []const u8, check: fn (u8) bool) bool {
+    for (bytes) |char| {
+        if (!check(char)) return false;
+    } else return true;
+}
+
+pub fn isGraph(c: u8) bool {
+    return std.ascii.isPrint(c) and c != 0x20;
+}
+
+pub fn isPunct(c: u8) bool {
+    return std.mem.indexOf(u8, "!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~", c);
+}
+
+fn toTitlecaseUtf8(cp: u21) u21 {
+    return uucode.get(.simple_titlecase_mapping, cp) orelse uucode.get(.simple_uppercase_mapping) orelse cp;
+}
+
 fn toUppercaseUtf8(cp: u21) u21 {
     return uucode.get(.simple_uppercase_mapping, cp) orelse cp;
 }
 
-const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
+fn toLowercaseUtf8(cp: u21) u21 {
+    return uucode.get(.simple_lowercase_mapping, cp) orelse cp;
+}
+
+pub const toTitle = if (use_utf8) toTitlecaseUtf8 else std.ascii.toUpper;
+pub const toUpper = if (use_utf8) toUppercaseUtf8 else std.ascii.toUpper;
+pub const toLower = if (use_utf8) toLowercaseUtf8 else std.ascii.toLower;
 
 /// Conditional uppercase
 fn condUpper(cp: Codepoint, enabled: bool) Codepoint {
@@ -111,7 +135,12 @@ pub fn cpIndexAscii(str: []const u8, index: usize) ?usize {
 }
 
 /// get the byte index based on codepoint index
-const cpIndex = if (use_utf8) cpIndexUtf8 else cpIndexAscii;
+pub const cpIndex = if (use_utf8) cpIndexUtf8 else cpIndexAscii;
+
+test "codepoint index" {
+    try expectEqual(cpIndex("hello", 3), 3);
+    if (use_utf8) try expectEqual(cpIndex("⇧hello", 3), 5);
+}
 
 fn codepointLengthAscii(str: []const u8) usize {
     return str.len;
@@ -131,11 +160,6 @@ fn codepointLengthUtf8(str: []const u8) usize {
 /// Get the length of the string in codepoints
 pub const codepointLength = if (use_utf8) codepointLengthUtf8 else codepointLengthUtf8;
 
-test "codepoint index" {
-    try expectEqual(cpIndex("hello", 3), 3);
-    if (use_utf8) try expectEqual(cpIndex("⇧hello", 3), 5);
-}
-
 pub fn strlenUtf8(str: []const u8) usize {
     var iter = Iterator.init(str);
     var count = 0;
@@ -153,6 +177,95 @@ pub fn strlenAscii(str: []const u8) usize {
 
 /// get the string length in codepoints
 const strlen = if (use_utf8) strlenUtf8 else strlenAscii;
+
+/// Finds the location of a codepoint
+pub fn findCodepoint(str: []const u8, cp: u21) ?usize {
+    var iter = Iterator.init(str);
+
+    var idx: usize = 0;
+    while (iter.next()) |cp_to_check| {
+        if (cp == cp_to_check) {
+            return idx;
+        }
+
+        idx = iter.i;
+    }
+
+    return null;
+}
+
+/// Returns the new left-most index in bytes, after trimming. Returns 0
+/// if there was nothing to trim.
+pub fn trimLeft(str: []const u8, trim_chars: []u8) usize {
+    var iter = Iterator.init(str);
+
+    outer: while (iter.next()) |cp_to_check| {
+        // Check this codepoint against all the trim_chars codepoints
+        var trim_char_iter = Iterator.init(trim_chars);
+        while (trim_char_iter.next()) |check_against| {
+            if (cp_to_check == check_against) {
+                continue :outer;
+            }
+        } else break;
+    }
+
+    return iter.i;
+}
+
+fn reverseNext(iter: *Iterator) ?Codepoint {
+    if (use_utf8) {
+        while (iter.i > 0) {
+            iter.i -= 1;
+
+            if (iter.bytes[iter.i] & 0x80 == 0) {
+                // Normal character
+                return iter.bytes[iter.i];
+            } else if (iter.bytes[iter.i] & 0xC0 == 0x80) {
+                // Partway through a code point, keep going backwards
+            } else if (iter.bytes[iter.i] & 0xE0 == 0xC0) {
+                // Two byte codepoint
+                if (iter.bytes.len - iter.i > 2) {
+                    return std.unicode.utf8Decode2(iter.bytes[iter.i..(iter.i + 2)]);
+                } else return 0xFFFD; // 0xFFFD = replacement character
+            } else if (iter.bytes[iter.i] & 0xF0 == 0xE0) {
+                // Three byte codepoint
+                if (iter.bytes.len - iter.i > 3) {
+                    return std.unicode.utf8Decode3(iter.bytes[iter.i..(iter.i + 3)]);
+                } else return 0xFFFD;
+            } else if (iter.bytes[iter.i] & 0xF8 == 0xF0) {
+                // Four byte codepoint
+                if (iter.bytes.len - iter.i > 4) {
+                    return std.unicode.utf8Decode4(iter.bytes[iter.i..(iter.i + 4)]);
+                } else return 0xFFFD;
+            } else return 0xFFFD; // 0xFFFD = replacement character
+        } else return null;
+    } else {
+        if (iter.i > 0) {
+            iter.i -= 1;
+            return iter.bytes[iter.i];
+        } else return null;
+    }
+}
+
+/// Returns the new length in bytes, after trimming. `trim_chars` can be
+/// utf8-encoded codepoints.
+pub fn trimRight(str: []const u8, trim_chars: []const u8) usize {
+    var iter = Iterator.init(str);
+    iter.i = str.len;
+
+    var len = iter.i;
+    outer: while (reverseNext(iter)) |cp_to_check| : (len = iter.i) {
+        // Check this codepoint against all the trim_chars codepoints
+        var trim_char_iter = Iterator.init(trim_chars);
+        while (trim_char_iter.next()) |check_against| {
+            if (cp_to_check == check_against) {
+                continue :outer;
+            }
+        } else break;
+    }
+
+    return len;
+}
 
 /// pattern points to a string like "[^a-z\ub5]"
 ///
@@ -384,7 +497,7 @@ test "Find last occurrence" {
     try expectEqual(findLastOccurrence("world", "hello"), null);
 }
 
-fn hex_digit_value(c: u8) ?u4 {
+pub fn hexDigitValue(c: u8) ?u4 {
     if (c >= '0' and c <= '9')
         return @intCast(c - '0');
     if (c >= 'a' and c <= 'f')
@@ -394,7 +507,12 @@ fn hex_digit_value(c: u8) ?u4 {
     return null;
 }
 
-fn octal_digit_value(c: u8) ?u3 {
+pub fn isHexDigit(c: u8) bool {
+    hexDigitValue(c) orelse return false;
+    return true;
+}
+
+fn octalDigitValue(c: u8) ?u3 {
     if (c >= '0' and c <= '7')
         return @intCast(c - '0');
     return null;
@@ -460,7 +578,7 @@ pub fn removeEscaping(source: []const u8, dest: []u8) usize {
 
                             var codepoint: u21 = 0;
                             while (i < source.len and i - hex_start < max_chars) : (i += 1) {
-                                const hex = hex_digit_value(source[i]);
+                                const hex = hexDigitValue(source[i]);
                                 if (hex) |unwrapped| {
                                     codepoint = (codepoint << 4) | unwrapped;
                                 } else break;
@@ -514,18 +632,18 @@ pub fn removeEscaping(source: []const u8, dest: []u8) usize {
                         },
                         '0'...'7' => {
                             const result = blk: {
-                                const first = octal_digit_value(source[i]).?;
+                                const first = octalDigitValue(source[i]).?;
                                 var codepoint: u8 = @intCast(first);
 
                                 i += 1;
                                 if (i == source.len) break :blk codepoint;
-                                if (octal_digit_value(source[i])) |second| {
+                                if (octalDigitValue(source[i])) |second| {
                                     codepoint = (@as(u8, @intCast(codepoint)) << 3) | second;
                                 } else break :blk codepoint;
 
                                 i += 1;
                                 if (i == source.len) break :blk codepoint;
-                                if (octal_digit_value(source[i])) |third| {
+                                if (octalDigitValue(source[i])) |third| {
                                     codepoint = (@as(u8, @intCast(codepoint)) << 3) | third;
                                 }
 

@@ -19,18 +19,32 @@ pub const Token = struct {
         end: usize,
     };
 
-    pub const Tag = enum {
-        none, // Nothing (can be safely ignored)
-        simple_string, // Simple string (no escaping needed)
-        brace_string, // String that was in braces (to disambiguate * from {*})
-        escaped_string, // String that needs escape character conversion
-        variable_subst, // Variable substitution
-        dict_sugar, // Syntax sugar for [dict get], $foo(bar)
-        command_subst, // command substitution
-        word_separator, // word separator (white space)
-        command_separator, // command separator (line feed or semicolon)
-        end_of_file, // end of script
-        expression_sugar, // Expression sugar
+    pub const Tag = enum(u8) {
+        /// Nothing (can be safely ignored)
+        none,
+        /// Simple string (no escaping needed)
+        simple_string,
+        /// String that was in braces (to disambiguate * from {*}. The former
+        /// is a string, the latter is argument expansion).
+        brace_string,
+        /// String that needs escape character conversion
+        escaped_string,
+        /// Variable substitution
+        variable_subst,
+        /// Syntax sugar for [dict get], $foo(bar)
+        dict_sugar,
+        /// command substitution
+        command_subst,
+        /// word separator (white space)
+        word_separator,
+        /// command separator (line feed or semicolon)
+        command_separator,
+        /// end of script
+        end_of_file,
+        /// Expression sugar
+        expression_sugar,
+
+        // Used for expr parsing
     };
 };
 
@@ -67,7 +81,9 @@ pub const Parser = struct {
         };
     }
 
-    pub fn parseScript(self: *Parser) !Token {
+    /// Parses a single token, or returns an appropriate error (details are
+    /// included in `parser.error_details`
+    pub fn parseScript(self: *Parser) Error!Token {
         const token: ?Token = blk: {
             while (!self.atEnd()) {
                 switch (self.current()) {
@@ -75,8 +91,10 @@ pub const Parser = struct {
                         if (self.peek(1) == '\n' and !self.in_quote) {
                             // escaped newline, not in quotes = word separator
                             break :blk self.parseSeparator();
+                        } else {
+                            // Else we're starting a string.
+                            break :blk try self.parseString();
                         }
-                        break :blk try self.parseString();
                     },
                     '\t', 12, '\r', ' ' => {
                         if (self.in_quote) {
@@ -96,20 +114,20 @@ pub const Parser = struct {
                     },
                     '[' => {
                         self.comment_possible = false;
-                        return self.parseCommand();
+                        break :blk self.parseCommand();
                     },
                     '$' => {
                         self.comment_possible = false;
-                        return self.parseVariable() catch |err| {
+                        break :blk self.parseVariable() catch |err| {
                             if (err == Error.NotVariable) {
                                 // An orphan '$'. Create a token for it.
                                 var token = self.newToken();
                                 token.tag = .simple_string;
                                 self.advance(1);
                                 token.loc.end = self.index;
-                                return token;
+                                break :blk token;
                             } else {
-                                return err;
+                                break :blk err;
                             }
                         };
                     },
@@ -117,7 +135,7 @@ pub const Parser = struct {
                         if (self.comment_possible) {
                             _ = try self.parseComment();
                         } else {
-                            return self.parseString();
+                            break :blk self.parseString();
                         }
                     },
                     else => {
@@ -128,15 +146,18 @@ pub const Parser = struct {
             break :blk null;
         };
 
-        // If nothing was returned, it means we've reached the end of the file
         if (token) |unwrapped| {
+            self.last_token_type = unwrapped.tag;
             return unwrapped;
         } else {
+            // If nothing was returned, it means we've reached the end of the file.
+
             if (self.in_quote) {
-                // Ended without closing the quote
+                // Ended without closing the quote.
                 return Error.MissingCloseQuote;
             }
 
+            // Return EOF.
             return .{
                 .tag = .end_of_file,
                 .loc = .{
@@ -147,7 +168,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseString(self: *Parser) !Token {
+    pub fn parseString(self: *Parser) !Token {
         switch (self.last_token_type) {
             .none, .word_separator, .command_separator, .simple_string, .escaped_string => {
                 // This checks if we're at the start of a new word. We need to check because code such as
@@ -250,7 +271,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseQuote(self: *Parser) !Token {
+    pub fn parseQuote(self: *Parser) !Token {
         // save for potential error message later if there's a missing close quote
         const index = self.index;
 
@@ -300,7 +321,7 @@ pub const Parser = struct {
         return Error.MissingCloseQuote;
     }
 
-    fn parseVariable(self: *Parser) !Token {
+    pub fn parseVariable(self: *Parser) !Token {
         const start = self.mark();
 
         // Skip the '$'
@@ -427,7 +448,7 @@ pub const Parser = struct {
         return token;
     }
 
-    fn parseCommand(self: *Parser) Error!Token {
+    pub fn parseCommand(self: *Parser) Error!Token {
         // Save in case the bracket is not matched for better error message.
         const index = self.index;
 
@@ -493,7 +514,7 @@ pub const Parser = struct {
         return Error.MissingCloseBracket;
     }
 
-    fn parseBrace(self: *Parser) !Token {
+    pub fn parseBrace(self: *Parser) !Token {
         // Save the current line in case the braces are mismatched (so we can point
         // right to where the problem is)
         const index = self.index;
@@ -551,7 +572,7 @@ pub const Parser = struct {
     }
 
     /// Parse until the end of the line.
-    fn parseEol(self: *Parser) Token {
+    pub fn parseEol(self: *Parser) Token {
         var token = self.newToken();
 
         while (!self.atEnd()) : (self.advance(1)) {
@@ -567,7 +588,7 @@ pub const Parser = struct {
     }
 
     /// Parses a word separator (spaces, tabs, etc). Accounts for newline escapes.
-    fn parseSeparator(self: *Parser) Token {
+    pub fn parseSeparator(self: *Parser) Token {
         var token = self.newToken();
 
         while (true) : (self.advance(1)) {
@@ -590,7 +611,7 @@ pub const Parser = struct {
         return token;
     }
 
-    fn parseComment(self: *Parser) !void {
+    pub fn parseComment(self: *Parser) !void {
         // Consume characters until \n (excluding escaping)
         while (!self.atEnd()) : (self.advance(1)) {
             switch (self.current()) {
@@ -635,7 +656,7 @@ pub const Parser = struct {
         }
     }
 
-    fn parseListSeparator(self: *Parser) Token {
+    pub fn parseListSeparator(self: *Parser) Token {
         var token = self.newToken();
         token.tag = .word_separator;
 
@@ -647,7 +668,7 @@ pub const Parser = struct {
         return token;
     }
 
-    fn parseListQuote(self: *Parser) Token {
+    pub fn parseListQuote(self: *Parser) Token {
         self.advance(1); // skip quote
 
         var token = self.newToken();
@@ -677,7 +698,7 @@ pub const Parser = struct {
         return token;
     }
 
-    fn parseListString(self: *Parser) Token {
+    pub fn parseListString(self: *Parser) Token {
         var token = self.newToken();
         token.tag = .simple_string;
 
@@ -701,8 +722,8 @@ pub const Parser = struct {
         return token;
     }
 
-    /// Initializes .start. Caller must initialize all other fields
-    fn newToken(self: *Parser) Token {
+    /// Initializes `.start`. Caller must initialize all other fields.
+    pub fn newToken(self: *Parser) Token {
         return .{
             .tag = undefined,
             .loc = .{
@@ -712,7 +733,7 @@ pub const Parser = struct {
         };
     }
 
-    fn errorIfAtEndAfterBackslash(self: *Parser) !void {
+    pub fn errorIfAtEndAfterBackslash(self: *Parser) !void {
         if (self.atEnd()) {
             self.error_details = .{
                 .index = self.index,
@@ -725,21 +746,21 @@ pub const Parser = struct {
         index: usize,
     };
 
-    fn mark(self: *Parser) Mark {
+    pub fn mark(self: *Parser) Mark {
         return .{
             .index = self.index,
         };
     }
 
-    fn restore(self: *Parser, mark_loc: Mark) void {
+    pub fn restore(self: *Parser, mark_loc: Mark) void {
         self.index = mark_loc.index;
     }
 
-    fn current(self: *Parser) u8 {
+    pub fn current(self: *Parser) u8 {
         return self.buffer[self.index];
     }
 
-    fn peek(self: *Parser, ahead_by: usize) ?u8 {
+    pub fn peek(self: *Parser, ahead_by: usize) ?u8 {
         if (self.index + ahead_by < self.buffer.len) {
             return self.buffer[self.index + ahead_by];
         } else {
@@ -747,12 +768,13 @@ pub const Parser = struct {
         }
     }
 
-    /// Handles incrementing line number
-    fn advance(self: *Parser, count: usize) void {
+    pub fn advance(self: *Parser, count: usize) void {
         self.index += count;
     }
 
-    fn startsWith(self: *Parser, str: []const u8) bool {
+    /// Checks if the next characters match `str`. Returns false if there are not enough
+    /// remaining characters.
+    pub fn startsWith(self: *Parser, str: []const u8) bool {
         if (self.buffer.len - self.index >= str.len) {
             return std.mem.eql(u8, self.buffer[self.index .. self.index + str.len], str);
         } else {
@@ -760,7 +782,7 @@ pub const Parser = struct {
         }
     }
 
-    fn atEnd(self: *Parser) bool {
+    pub fn atEnd(self: *Parser) bool {
         return self.index == self.buffer.len;
     }
 };
