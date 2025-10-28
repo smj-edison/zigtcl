@@ -70,13 +70,13 @@ const AsciiIterator = struct {
 pub const Iterator = if (use_utf8) uucode.utf8.Iterator else AsciiIterator;
 
 /// lexographical comparision of codepoints
-pub fn compare(a: []const u8, b: []const u8) std.math.Order {
+pub fn compare(a: []const u8, b: []const u8, case_insensitive: bool) std.math.Order {
     var a_iter = Iterator.init(a);
     var b_iter = Iterator.init(b);
 
     while (true) {
-        const a_cp = a_iter.next();
-        const b_cp = b_iter.next();
+        const a_cp = condUpper(a_iter.next(), case_insensitive);
+        const b_cp = condUpper(b_iter.next(), case_insensitive);
 
         if (a_cp != null and b_cp != null) {
             const order = std.math.order(u21, a_cp.?, b_cp.?);
@@ -251,8 +251,6 @@ test "charsetMatch" {
 }
 
 /// Glob-style pattern matching.
-///
-/// Note: string *must* be valid UTF-8 sequences.
 pub fn globMatch(pattern: []const u8, str: []const u8, case_insensitive: bool) bool {
     var pattern_iter = Iterator.init(pattern);
     var string_iter = Iterator.init(str);

@@ -265,24 +265,24 @@ pub fn vmemUnmap(memory: []align(heap.page_size_min) u8) void {
 pub fn vmemMapItems(comptime T: type, count: usize) ![]align(heap.page_size_min) T {
     const byte_count = @sizeOf(T) * count;
     const mapped = heap.PageAllocator.map(byte_count, .fromByteUnits(@alignOf(T))) orelse return error.OutOfMemory;
-    const items: [*]T = @ptrCast(mapped);
+    const items: [*]T = @ptrCast(@alignCast(mapped));
 
-    return items[0..count];
+    return @alignCast(items[0..count]);
 }
 
-pub fn vmemUnmapItems(comptime T: type, items: []align(heap.page_size_min) T) void {
+pub fn vmemUnmapItems(comptime T: type, items: []T) void {
     const byte_count = items.len * @sizeOf(T);
     const bytes: [*]u8 = @ptrCast(items.ptr);
-    heap.PageAllocator.unmap(bytes[0..byte_count]);
+    heap.PageAllocator.unmap(@alignCast(bytes[0..byte_count]));
 }
 
 test "Virtual memory" {
-    var array = try vmemMap(usize, 5);
+    var array = try vmemMap(5);
     array[0] = 5;
     array[1] = 10;
     vmemUnmap(array);
 
-    array = try vmemMap(usize, 1 << 32);
+    array = try vmemMap(1 << 32);
     array[1 << 20] = 5;
     array[1 << 30] = 10;
     vmemUnmap(array);

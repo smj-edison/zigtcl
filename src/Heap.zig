@@ -6,7 +6,7 @@ const assert = std.debug.assert;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const string_utils = @import("string_utils.zig");
+const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
 
 // These numbers are final, and can be depended on to be their current values
@@ -57,7 +57,7 @@ const Object = packed struct {
         u: packed union {
             str: packed struct {
                 index: u32,
-                length: u26,
+                len: u26,
             },
             /// Be sure to >> 6 before setting, and << 6 when reading. Must be non-null.
             ptr: u58,
@@ -74,7 +74,7 @@ const Object = packed struct {
             return false;
         } else {
             // Must check length too, as tiny strings use a null index but non-zero length
-            return self.str.u.str.index == 0 and self.str.u.str.length == 0;
+            return self.str.u.str.index == 0 and self.str.u.str.len == 0;
         }
     }
 };
@@ -86,7 +86,6 @@ comptime {
 pub const Tag = enum(u5) {
     none,
     index,
-    return_code,
     number,
     float,
     /// `.tiny_string` _must_ have at least one byte (e.g. not null and not empty)
@@ -95,12 +94,34 @@ pub const Tag = enum(u5) {
     list,
     reference,
     custom_type,
+    /// Used for tracking allocation
+    free,
+};
+
+pub const ListIndex = packed struct {
+    u: packed union {
+        index: u32,
+        end_offset: i33,
+    },
+    is_end: bool,
+
+    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_end = true };
+
+    pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) !usize {
+        if (self.is_end) {
+            const idx = std.math.add(i33, self.u.end_offset + list_len) catch return error.BadIndex;
+            if (idx < 0) return error.BadIndex;
+            if (idx > list_len) return error.BadIndex;
+            return @intCast(idx);
+        } else {
+            return self.u.index;
+        }
+    }
 };
 
 pub const Body = packed union {
-    /// Array index
-    index: u32,
-    return_code: bool,
+    /// List index
+    index: ListIndex,
     number: i64,
     float: f64,
     string: packed struct {
@@ -114,7 +135,7 @@ pub const Body = packed union {
     },
     list: packed struct {
         start: u32,
-        length: u32,
+        len: u32,
     },
     reference: Handle,
     custom_type: packed struct {
@@ -215,7 +236,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     } else {
         try strings.ensureTotalCapacity(gpa, 32);
     }
-    errdefer if (cfg.use_vmem) memutil.vmemUnmap(strings.items) else strings.deinit(gpa);
+    errdefer if (cfg.use_vmem) memutil.vmemUnmap(@alignCast(strings.items)) else strings.deinit(gpa);
 
     // Init type instances
     var type_instances: CustomTypeInstanceList = .{};
@@ -229,7 +250,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         try type_instances.ensureTotalCapacity(gpa, 32);
     }
     errdefer if (cfg.use_vmem) {
-        memutil.vmemUnmapItems(CustomTypeInstance, type_instances.items);
+        memutil.vmemUnmapItems(CustomTypeInstance, @alignCast(type_instances.items));
     } else {
         type_instances.deinit(gpa);
     };
@@ -295,13 +316,28 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     // Make sure arrays have space for new objects
     if (self.objects.len < index + count) {
+        const start_of_new = self.objects.len;
         try self.objects.resize(self.heapAlloc(), index + count);
+        @memset(self.objects.items(.object)[start_of_new..self.objects.len], .{
+            .str = .{
+                .u = .{ .str = .{ .index = 0, .len = 0 } },
+                .is_ptr = false,
+            },
+            .tag = .free,
+            .body = .{
+                .number = 0,
+            },
+        });
     }
 
-    // Initialize to empty object
+    for (self.objects.items(.object)[index..end]) |obj| {
+        assert(obj.tag == .free);
+    }
+
+    // Initialize all as empty objects
     @memset(self.objects.items(.object)[index..end], .{
         .str = .{
-            .u = .{ .str = .{ .index = 0, .length = 0 } },
+            .u = .{ .str = .{ .index = 0, .len = 0 } },
             .is_ptr = false,
         },
         .tag = .none,
@@ -335,6 +371,7 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 fn freeLocalObject(self: *Heap, index: u32) void {
     self.invalidateLocalString(index);
     self.invalidateLocalBody(index);
+    self.getLocalObject(index).tag = .free;
 
     const metadata = self.objects.get(index).metadata;
     if (metadata.is_alloc_head) {
@@ -344,12 +381,21 @@ fn freeLocalObject(self: *Heap, index: u32) void {
     }
 }
 
+pub fn getHeap(handle: Handle) *Heap {
+    return &heaps[handle.heap];
+}
+
+pub fn canShimmer(handle: Handle) bool {
+    // Can't shimmer if it's shared between threads
+    return !getHeap(handle).objects.get(handle.index).metadata.cross_thread;
+}
+
 pub fn invalidateString(handle: Handle) void {
-    heaps[handle.index].invalidateLocalString(handle.index);
+    getHeap(handle).invalidateLocalString(handle.index);
 }
 
 pub fn invalidateBody(handle: Handle) void {
-    heaps[handle.index].invalidateLocalBody(handle.index);
+    getHeap(handle).invalidateLocalBody(handle.index);
 }
 
 fn invalidateLocalString(self: *Heap, index: u32) void {
@@ -357,10 +403,10 @@ fn invalidateLocalString(self: *Heap, index: u32) void {
 
     switch (self.getLocalStringDetails(index)) {
         .long => |long_str| {
-            long_str.decrRefCount();
+            long_str.decrRefCount(self.gpa);
         },
         .normal => {
-            self.freeString(obj.str.u.str.index, obj.str.u.str.length);
+            self.freeString(obj.str.u.str.index, obj.str.u.str.len);
         },
         .null, .empty, .tiny => {},
     }
@@ -369,7 +415,7 @@ fn invalidateLocalString(self: *Heap, index: u32) void {
     obj.str.is_ptr = false;
     obj.str.u.str = .{
         .index = 0,
-        .length = 0,
+        .len = 0,
     };
 }
 
@@ -380,7 +426,7 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
         .list => {
             const list = obj.body.list;
 
-            for (0..list.length) |i| {
+            for (0..list.len) |i| {
                 self.freeLocalObject(@intCast(list.start + i));
             }
         },
@@ -398,26 +444,27 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
             // How come string is a no-op? Because we could potentially
             // double-free when freeStringRep is called.
         },
-        .tiny_string, .none, .index, .return_code, .number, .float => {},
+        .tiny_string, .none, .index, .number, .float => {},
     }
 }
 
 /// Allocates 1 + length, in order to make space for the null byte
-fn createString(self: *Heap, length: u32) !u32 {
-    const length_with_null = length + 1;
+fn createString(self: *Heap, len: u32) !u32 {
+    const length_with_null = len + 1;
     self.lockTracking();
     defer self.unlockTracking();
     const new_string: u32 = @intCast(try self.string_tracking.allocCount(self.gpa, length_with_null));
     return new_string;
 }
 
-fn freeString(self: *Heap, index: u32, length: u32) void {
-    const length_with_null = length + 1;
+fn freeString(self: *Heap, index: u32, len: u32) void {
+    const length_with_null = len + 1;
     self.lockTracking();
     self.string_tracking.freeCount(index, length_with_null);
     self.unlockTracking();
 }
 
+/// Increase ref count if possible, otherwise duplicate.
 pub fn borrow(self: *Heap, handle: Handle) !Handle {
     // If the object isn't ref counted, then we'll need to clone it (i.e. a list item)
     if (!handle.ref_counted) {
@@ -425,7 +472,7 @@ pub fn borrow(self: *Heap, handle: Handle) !Handle {
     }
 
     // This object may have come from another heap
-    const heap = &heaps[handle.heap];
+    const heap = getHeap(handle);
 
     if (cfg.threading and heap.objects.get(handle.index).metadata.cross_thread) {
         _ = @atomicRmw(u32, &heap.objects.items(.ref_count)[handle.index], .Add, 1, .monotonic);
@@ -442,7 +489,7 @@ pub fn release(self: *Heap, handle: Handle) void {
     _ = self;
 
     // This object may have come from another heap
-    var heap = &heaps[handle.heap];
+    var heap = getHeap(handle);
 
     // If after_sub == 0, then this object will be freed
     var after_sub: u32 = undefined;
@@ -463,8 +510,8 @@ pub fn release(self: *Heap, handle: Handle) void {
     }
 }
 
-fn duplicateObjString(self: *Heap, index: u32) !Object.StrOrPtr {
-    switch (self.getLocalStringDetails(index)) {
+fn duplicateObjString(self: *Heap, handle: Handle) !Object.StrOrPtr {
+    switch (getStringDetails(handle)) {
         .long => |long_str| {
             long_str.incrRefCount();
             return .{
@@ -473,38 +520,37 @@ fn duplicateObjString(self: *Heap, index: u32) !Object.StrOrPtr {
             };
         },
         .normal => |bytes| {
-            const new_string = try self.createString(bytes.len);
-            @memcpy(self.strings.items[new_string..(new_string + bytes.length) :0], bytes);
+            const new_string = try self.createString(@intCast(bytes.len));
+            @memcpy(self.strings.items[new_string..(new_string + bytes.len) :0], bytes);
 
             return .{
-                .u = .{ .str = .{ .index = new_string, .length = bytes.length } },
+                .u = .{ .str = .{ .index = new_string, .len = @intCast(bytes.len) } },
                 .is_ptr = false,
             };
         },
         .tiny, .null, .empty => {
             // Caller is responsible to copy the tiny string
-            const obj = self.getLocalObject(index);
-            return obj.str;
+            return peek(handle).str;
         },
     }
 }
 
-fn duplicateSingle(self: *Heap, index: u32) !Object {
-    const src = self.getLocalObject(index);
+fn duplicateSingle(self: *Heap, handle: Handle) !Object {
+    const src = peek(handle);
     switch (src.tag) {
-        .none, .index, .return_code, .number, .float, .string, .tiny_string => {
+        .none, .index, .number, .float, .string, .tiny_string => {
             return .{
-                .str = try self.duplicateObjString(src),
+                .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
                 .body = src.body,
             };
         },
         .reference => {
             const ref = src.body.reference;
-            const new_handle = try self.duplicate(ref);
+            const new_handle = try self.borrow(ref);
             return .{
                 .str = .{
-                    .u = .{ .str = .{ .index = 0, .length = 0 } },
+                    .u = .{ .str = .{ .index = 0, .len = 0 } },
                     .is_ptr = false,
                 },
                 .tag = .reference,
@@ -515,11 +561,12 @@ fn duplicateSingle(self: *Heap, index: u32) !Object {
             const custom_type = src.body.custom_type;
 
             var new_object: Object = .{
-                .str = try self.duplicateObjString(index),
+                .str = try self.duplicateObjString(handle),
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = self.createCustomTypeInstance(),
+                        .index = try self.createCustomTypeInstance(undefined),
+                        .type_id = custom_type.type_id,
                     },
                 },
             };
@@ -540,41 +587,48 @@ pub fn duplicate(self: *Heap, handle: Handle) error{OutOfMemory}!Handle {
         .list => {
             const old_head = src;
             const old_body = old_head.body.list;
-            const old_start = old_body.start;
-            const old_end = old_body.start + old_body.length;
-            const old_items = heaps[handle.heap].objects.items(.object)[old_start..old_end];
 
-            const new_list_idx = try self.createObjects(1 + old_body.length);
+            const new_list_idx = try self.createObjects(1 + old_body.len);
             errdefer {
                 // Iterate in reverse order to prevent freeing the head of the list first
-                var i = new_list_idx + 1 + old_body.length;
+                var i = new_list_idx + 1 + old_body.len;
                 while (i > 0) {
                     i -= 1;
                     self.release(self.normalHandle(i));
                 }
             }
-            var new_head: *Object = &self.objects.items(.object)[new_list_idx];
+            const new_head: *Object = &self.objects.items(.object)[new_list_idx];
             const new_start = new_list_idx + 1;
-            const new_end = new_start + old_body.length;
+            const new_end = new_start + old_body.len;
             var new_items = self.objects.items(.object)[new_start..new_end];
 
-            new_head.* = try self.duplicateObjString(old_head);
-            new_head.tag = .list;
-            new_head.body.list = .{
-                .start = new_list_idx + 1,
-                .length = old_body.length,
+            // Duplicate head of list
+            new_head.* = .{
+                .str = try self.duplicateObjString(handle),
+                .tag = .list,
+                .body = .{
+                    .list = .{
+                        .start = new_list_idx + 1,
+                        .len = old_body.len,
+                    },
+                },
             };
 
+            // Duplicate items of list
             var i: usize = 0;
-            while (i < old_body.length) : (i += 1) {
-                new_items[i] = try self.duplicateSingle(&old_items[i]);
+            while (i < old_body.len) : (i += 1) {
+                new_items[i] = try self.duplicateSingle(.{
+                    .heap = handle.heap,
+                    .index = @intCast(old_body.start + i),
+                    .ref_counted = false,
+                });
             }
 
             return self.normalHandle(new_list_idx);
         },
         else => {
             const new_object = try self.createObject();
-            self.objects.items(.object)[new_object.index] = try self.duplicateSingle(src);
+            self.objects.items(.object)[new_object.index] = try self.duplicateSingle(handle);
             return new_object;
         },
     }
@@ -589,20 +643,20 @@ pub fn normalHandle(self: *Heap, index: u32) Handle {
 }
 
 pub fn peek(handle: Handle) *Object {
-    return &heaps[handle.heap].getLocalObject(handle.index);
+    return getHeap(handle).getLocalObject(handle.index);
 }
 
-fn getLocalObject(self: *Heap, index: u32) *Object {
-    return self.objects.items(.object)[index];
+pub fn getLocalObject(self: *Heap, index: u32) *Object {
+    return &self.objects.items(.object)[index];
 }
 
 pub fn getString(handle: Handle) ![:0]const u8 {
-    return try heaps[handle.heap].getLocalString(handle.index);
+    return try getHeap(handle).getLocalString(handle.index);
 }
 
 /// Copies provided string.
 pub fn setString(handle: Handle, bytes: [:0]const u8) !void {
-    const heap = heaps[handle.heap];
+    const heap = getHeap(handle);
     const new_str = try heap.gpa.dupeZ(u8, bytes);
     errdefer heap.gpa.free(new_str);
     const took_ownership = try heap.setLocalString(handle.index, new_str);
@@ -619,7 +673,7 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
     if (bytes.len == 0) {
         new_str_or_ptr.u.str = .{
             .index = empty_string,
-            .length = 0,
+            .len = 0,
         };
         new_str_or_ptr.is_ptr = false;
     } else if (bytes.len < LongString.split_point) {
@@ -631,7 +685,7 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
 
         new_str_or_ptr.u.str = .{
             .index = local_string,
-            .length = @intCast(bytes.len),
+            .len = @intCast(bytes.len),
         };
         new_str_or_ptr.is_ptr = false;
     } else {
@@ -667,11 +721,11 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
                 // Somebody else must've won this, so we'll use their string
                 if (new_str_or_ptr.is_ptr) {
                     took_ownership = false;
-                    LongString.fromInt(new_str_or_ptr.u.ptr).freeUnchecked();
+                    LongString.fromInt(new_str_or_ptr.u.ptr).freeUnchecked(self.gpa);
                 } else {
                     const local_string = new_str_or_ptr.u.str;
                     if (local_string.index > 1) {
-                        self.freeString(local_string.index, local_string.length);
+                        self.freeString(local_string.index, local_string.len);
                     }
                 }
 
@@ -706,22 +760,19 @@ const empty_string_value = "";
 fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = &self.objects.items(.object)[index];
 
-    // Check if it already has a string representation
-    if (obj.str.is_ptr and obj.str.u.ptr != 0) {
-        return LongString.fromInt(obj.str.u.ptr).string;
-    } else if (!obj.str.is_ptr) {
-        const str = obj.str.u.str;
-
-        if (obj.tag == .tiny_string) {
-            const str_value: *[8]u8 = @ptrCast(&obj.body.tiny_string.bytes);
-            return str_value[0..str.length :0];
-        } else if (str.index == null_string) {
-            // Null string, don't return so we keep going in the function
-        } else if (str.index == empty_string) {
+    switch (self.getLocalStringDetails(index)) {
+        .long => |long_str| {
+            return long_str.string;
+        },
+        .normal, .tiny => |str| {
+            return str;
+        },
+        .empty => {
             return empty_string_value;
-        } else {
-            return self.strings.items[str.index..(str.index + str.length) :0];
-        }
+        },
+        .null => {
+            // Keep going in code
+        },
     }
 
     // No representation, so we better generate it
@@ -741,7 +792,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
         .list => {
             const list = obj.body.list;
-            new_str = try getListString(self, list.start, list.length);
+            new_str = try getListString(self, list.start, list.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
@@ -762,24 +813,24 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     return self.getLocalString(index);
 }
 
-fn getListString(self: *Heap, index: u32, length: u32) ![:0]u8 {
+fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
     var fallback = std.heap.stackFallback(64, self.gpa);
     var stack_alloc = fallback.get();
-    var quoting_types = try stack_alloc.alloc(string_utils.QuotingType, length);
+    var quoting_types = try stack_alloc.alloc(stringutil.QuotingType, len);
     defer stack_alloc.free(quoting_types);
 
     // Step 1: calculate the string length.
     var total_length: usize = 0;
-    for (0..length) |i| {
+    for (0..len) |i| {
         const element_string = try self.getLocalString(@intCast(index + i));
-        quoting_types[i] = string_utils.calculateNeededQuotingType(element_string);
+        quoting_types[i] = stringutil.calculateNeededQuotingType(element_string);
         if (i == 0 and quoting_types[i] == .bare and
             element_string.len > 0 and element_string[0] == '#')
         {
             // Make sure the first element has # escaped in braces
             quoting_types[i] = .brace;
         }
-        total_length += string_utils.quoteSize(quoting_types[i], element_string.len);
+        total_length += stringutil.quoteSize(quoting_types[i], element_string.len);
         total_length += 1; // space between each element
     }
 
@@ -788,9 +839,9 @@ fn getListString(self: *Heap, index: u32, length: u32) ![:0]u8 {
     errdefer self.gpa.free(unfinished_str);
     var written: usize = 0;
 
-    for (0..length) |i| {
+    for (0..len) |i| {
         const element_string = try self.getLocalString(@intCast(index + i));
-        written += string_utils.quoteString(
+        written += stringutil.quoteString(
             quoting_types[i],
             element_string,
             unfinished_str[written..],
@@ -798,7 +849,7 @@ fn getListString(self: *Heap, index: u32, length: u32) ![:0]u8 {
         );
 
         // Add a space (except at the end of the list)
-        if (i + 1 < length) {
+        if (i + 1 < len) {
             unfinished_str[written] = ' ';
             written += 1;
         }
@@ -820,8 +871,12 @@ const StringDetails = union(enum) {
     empty: void,
     tiny: [:0]const u8,
     normal: [:0]const u8,
-    long: *LongString,
+    long: *align(LongString.align_amt) LongString,
 };
+
+pub fn getStringDetails(handle: Handle) StringDetails {
+    return getHeap(handle).getLocalStringDetails(handle.index);
+}
 
 fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
     const obj = self.getLocalObject(index);
@@ -832,38 +887,28 @@ fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
         // so not null, and not empty.
         const as_bytes: *[7:0]u8 = @ptrCast(&obj.body.tiny_string.bytes);
         return .{
-            .tiny = as_bytes[0..obj.str.u.str.length :0],
+            .tiny = as_bytes[0..obj.str.u.str.len :0],
         };
     }
 
-    // Normal string or long string
-    if (obj.tag == .string) {
-        if (obj.str.is_ptr) {
-            // Convert to LongString ptr (guaranteed to be non-null)
-            return .{
-                .long = LongString.fromInt(obj.str.u.ptr),
-            };
+    // Normal string or long string?
+    if (obj.str.is_ptr) {
+        // Convert to LongString ptr (guaranteed to be non-null)
+        return .{
+            .long = LongString.fromInt(obj.str.u.ptr),
+        };
+    } else {
+        const str = obj.str.u.str;
+        if (str.index == null_string) {
+            return .null;
+        } else if (str.index == empty_string) {
+            return .empty;
         } else {
-            const str = obj.str.u.str;
-            if (str.index == null_string) {
-                return .null;
-            } else if (str.index == empty_string) {
-                return .empty;
-            } else {
-                return .{
-                    .normal = &self.strings.items[str.index..(str.index + str.length)],
-                };
-            }
+            return .{
+                .normal = self.strings.items[str.index..(str.index + str.len) :0],
+            };
         }
     }
-}
-
-fn lockTracking(self: *Heap) void {
-    if (self.heap_id == global_heap_id) self.tracking_mutex.lock();
-}
-
-fn unlockTracking(self: *Heap) void {
-    if (self.heap_id == global_heap_id) self.tracking_mutex.unlock();
 }
 
 pub const LongString = struct {
@@ -893,7 +938,7 @@ pub const LongString = struct {
         }
     }
 
-    pub fn decrRefCount(gpa: Allocator, self: *align(align_amt) LongString) void {
+    pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
         if (cfg.threading) {
             _ = @atomicRmw(usize, &self.ref_count, .Sub, 1, .monotonic);
         } else {
@@ -909,6 +954,25 @@ pub const LongString = struct {
         gpa.destroy(self);
     }
 };
+
+fn createCustomTypeInstance(self: *Heap, instance: CustomTypeInstance) !u32 {
+    const index = self.type_instances.items.len;
+    if ((cfg.use_vmem or cfg.threading) and index == cfg.max_custom_type_instances) {
+        // FIXME: handle this more gracefully, maybe make the return type optional
+        // or return an error?
+        @panic("Ran out of space for custom type instances");
+    }
+    try self.type_instances.append(self.heapAlloc(), instance);
+    return @intCast(index);
+}
+
+fn lockTracking(self: *Heap) void {
+    if (self.heap_id == global_heap_id) self.tracking_mutex.lock();
+}
+
+fn unlockTracking(self: *Heap) void {
+    if (self.heap_id == global_heap_id) self.tracking_mutex.unlock();
+}
 
 pub const CustomTypes = struct {
     elem: [cfg.max_custom_types]CustomType = undefined,

@@ -7,7 +7,7 @@ const isAlphanumeric = std.ascii.isAlphanumeric;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
-const string = @import("string_utils.zig");
+const stringutil = @import("stringutil.zig");
 const options = @import("options");
 
 pub const Token = struct {
@@ -17,7 +17,6 @@ pub const Token = struct {
     pub const Location = struct {
         start: usize,
         end: usize,
-        line_no: usize,
     };
 
     pub const Tag = enum {
@@ -38,7 +37,6 @@ pub const Token = struct {
 pub const Parser = struct {
     buffer: []const u8,
     index: usize,
-    line_no: u32, // current line number
     /// We need to keep track of whether we're in a quote or not across `next`
     /// invocations, because something like `set x "hello[set world]!"` emits
     /// three tokens.
@@ -47,7 +45,7 @@ pub const Parser = struct {
     /// next token to be a comment (set to true after newline or semicolon).
     comment_possible: bool,
     last_token_type: Token.Tag,
-    error_details: ?struct { line_no: u32, index: usize },
+    error_details: ?struct { index: usize },
 
     const Error = error{
         MissingCloseBracket,
@@ -62,7 +60,6 @@ pub const Parser = struct {
         return .{
             .buffer = buffer,
             .index = 0,
-            .line_no = 1,
             .in_quote = false,
             .comment_possible = true,
             .last_token_type = .none,
@@ -145,7 +142,6 @@ pub const Parser = struct {
                 .loc = .{
                     .start = self.index,
                     .end = self.index,
-                    .line_no = self.line_no,
                 },
             };
         }
@@ -165,7 +161,6 @@ pub const Parser = struct {
                         // if it's not matched.
                         self.error_details = .{
                             .index = self.index,
-                            .line_no = self.line_no,
                         };
                         self.advance(1);
                     },
@@ -257,7 +252,6 @@ pub const Parser = struct {
 
     fn parseQuote(self: *Parser) !Token {
         // save for potential error message later if there's a missing close quote
-        const line_no = self.line_no;
         const index = self.index;
 
         // skip the quote
@@ -302,7 +296,6 @@ pub const Parser = struct {
         // finding a closing quote.
         self.error_details = .{
             .index = index,
-            .line_no = line_no,
         };
         return Error.MissingCloseQuote;
     }
@@ -332,12 +325,10 @@ pub const Parser = struct {
         // Braced variable? (e.g. ${foo})
         if (self.current() == '{') {
             const brace_index = self.index;
-            const brace_line_no = self.line_no;
 
             self.advance(1);
             // set new token location to inside the brace
             token.loc.start = self.index;
-            token.loc.line_no = self.line_no;
 
             // search for closing brace
             var found_closing_brace = false;
@@ -351,7 +342,6 @@ pub const Parser = struct {
             if (!found_closing_brace) {
                 self.error_details = .{
                     .index = brace_index,
-                    .line_no = brace_line_no,
                 };
                 return Error.MissingCloseBrace;
             }
@@ -439,7 +429,6 @@ pub const Parser = struct {
 
     fn parseCommand(self: *Parser) Error!Token {
         // Save in case the bracket is not matched for better error message.
-        const line_no = self.line_no;
         const index = self.index;
 
         // Skip opening '['
@@ -499,7 +488,6 @@ pub const Parser = struct {
         // without balancing our brackets. Thus, a missing bracket error
         // is needed.
         self.error_details = .{
-            .line_no = line_no,
             .index = index,
         };
         return Error.MissingCloseBracket;
@@ -508,7 +496,6 @@ pub const Parser = struct {
     fn parseBrace(self: *Parser) !Token {
         // Save the current line in case the braces are mismatched (so we can point
         // right to where the problem is)
-        const line_no = self.line_no;
         const index = self.index;
 
         // Skip '{'
@@ -558,7 +545,6 @@ pub const Parser = struct {
         // If we've reached this point, it means we've reached the end of input without
         // our braces being balanced. As such, we should error.
         self.error_details = .{
-            .line_no = line_no,
             .index = index,
         };
         return Error.MissingCloseBrace;
@@ -627,7 +613,6 @@ pub const Parser = struct {
                 .tag = .end_of_file,
                 .loc = .{
                     .start = self.index,
-                    .line_no = self.line_no,
                     .end = self.index,
                 },
             };
@@ -716,14 +701,13 @@ pub const Parser = struct {
         return token;
     }
 
-    /// Initializes .start and .line_no. Caller must initialize all other fields
+    /// Initializes .start. Caller must initialize all other fields
     fn newToken(self: *Parser) Token {
         return .{
             .tag = undefined,
             .loc = .{
                 .start = self.index,
                 .end = undefined,
-                .line_no = self.line_no,
             },
         };
     }
@@ -732,7 +716,6 @@ pub const Parser = struct {
         if (self.atEnd()) {
             self.error_details = .{
                 .index = self.index,
-                .line_no = self.line_no,
             };
             return Error.TrailingBackslash;
         }
@@ -740,19 +723,16 @@ pub const Parser = struct {
 
     const Mark = struct {
         index: usize,
-        line_no: u32,
     };
 
     fn mark(self: *Parser) Mark {
         return .{
             .index = self.index,
-            .line_no = self.line_no,
         };
     }
 
     fn restore(self: *Parser, mark_loc: Mark) void {
         self.index = mark_loc.index;
-        self.line_no = mark_loc.line_no;
     }
 
     fn current(self: *Parser) u8 {
@@ -769,10 +749,7 @@ pub const Parser = struct {
 
     /// Handles incrementing line number
     fn advance(self: *Parser, count: usize) void {
-        for (0..count) |_| {
-            if (self.buffer[self.index] == '\n') self.line_no += 1;
-            self.index += 1;
-        }
+        self.index += count;
     }
 
     fn startsWith(self: *Parser, str: []const u8) bool {
