@@ -284,7 +284,13 @@ pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Han
             const after_range_len = bytes.len - byte_end - 1;
 
             const new_str = newStringToFill(Heap.getHeap(str), up_to_range_len + to_insert_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str);
+            const new_bytes = Heap.getStringMut(new_str) catch |err| {
+                switch (err) {
+                    // empty strings aren't mutable, so we'll just return the empty string
+                    error.NotMutable => return new_str,
+                    error.OutOfMemory => return err,
+                }
+            };
 
             @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
             @memcpy(new_bytes[up_to_range_len..(up_to_range_len + to_insert_len)], to_insert_bytes);
@@ -298,7 +304,13 @@ pub fn stringReplace(str: *Handle, start: *Handle, end: *Handle, to_insert: ?Han
             const after_range_len = bytes.len - byte_end - 1;
 
             const new_str = newStringToFill(Heap.getHeap(str), up_to_range_len + after_range_len);
-            const new_bytes = Heap.getStringMut(new_str);
+            const new_bytes = Heap.getStringMut(new_str) catch |err| {
+                switch (err) {
+                    // empty strings aren't mutable, so we'll just return the empty string
+                    error.NotMutable => return new_str,
+                    error.OutOfMemory => return err,
+                }
+            };
 
             @memcpy(new_bytes[0..up_to_range_len], bytes[0..up_to_range_len]);
             @memcpy(new_bytes[up_to_range_len..], bytes[(byte_end + 1)..]);
@@ -337,7 +349,13 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
         }
 
         const new_str = try newStringToFill(Heap.getHeap(str), new_len);
-        const new_bytes = try Heap.getStringMut(new_str);
+        const new_bytes = try Heap.getStringMut(new_str) catch |err| {
+            switch (err) {
+                // empty strings aren't mutable, so we'll just return the empty string
+                error.NotMutable => return new_str,
+                error.OutOfMemory => return err,
+            }
+        };
 
         // Now go through and write all the bytes
         iter = stringutil.Iterator.init(bytes);
@@ -363,7 +381,13 @@ pub fn stringCaseConversion(str: Handle, mode: enum { upper, lower, title }) !Ha
     } else {
         const new_len = bytes.len;
         const new_str = try newStringToFill(Heap.getHeap(str), new_len);
-        const new_bytes = try Heap.getStringMut(new_str);
+        const new_bytes = try Heap.getStringMut(new_str) catch |err| {
+            switch (err) {
+                // Empty strings aren't mutable, so we'll just return the empty string.
+                error.NotMutable => return new_str,
+                error.OutOfMemory => return err,
+            }
+        };
 
         for (bytes, new_bytes) |old_char, *new_char| {
             if (mode == .upper) {

@@ -6,6 +6,7 @@ const std = @import("std");
 const math = std.math;
 const heap = std.heap;
 const mem = std.mem;
+const testing = std.testing;
 const assert = std.debug.assert;
 const Allocator = mem.Allocator;
 
@@ -286,4 +287,114 @@ test "Virtual memory" {
     array[1 << 20] = 5;
     array[1 << 30] = 10;
     vmemUnmap(array);
+}
+
+pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
+    // Heavily inspired by std.heap.MemoryPool
+
+    return struct {
+        const Self = @This();
+        const no_next_free: usize = std.math.maxInt(usize);
+
+        // Make sure we have enough space for a usize.
+        const node_align = std.mem.Alignment.of(usize).max(.of(Item));
+
+        items: []align(node_align.toByteUnits()) Item,
+        /// If == no_next_free, it doesn't point to anything
+        next_free: usize = no_next_free,
+        /// `items.len` is the capacity, while `len` is how many
+        /// items are being used.
+        len: usize = 0,
+
+        /// Capacity must be > 0
+        pub fn initWithCapacity(gpa: Allocator, capacity: usize) !Self {
+            if (capacity == 0) @panic("Capacity must be larger than 0");
+
+            if (use_vmem) {
+                return .{
+                    .items = try vmemMapItems(Item, capacity),
+                };
+            } else {
+                return .{
+                    .items = try gpa.alloc(Item, capacity),
+                };
+            }
+        }
+
+        pub fn create(self: *Self, gpa: Allocator) !usize {
+            // Check if there's anything on the free list
+            if (self.next_free != no_next_free) {
+                const next_free = self.next_free;
+                // follow to next free
+                const item_ptr: *Item = &self.items[next_free];
+                const int_ptr: *usize = @ptrCast(item_ptr);
+                self.next_free = int_ptr.*;
+                return next_free;
+            }
+
+            // Resize/realloc if needed
+            if (self.len >= self.items.len) {
+                if (use_vmem) {
+                    return error.OutOfMemory;
+                } else if (gpa.resize(self.items, self.items.len * 2)) {
+                    self.items.len *= 2;
+                } else {
+                    self.items = try gpa.realloc(self.items, self.items.len * 2);
+                }
+            }
+
+            const new_index = self.len;
+            self.len += 1;
+            return new_index;
+        }
+
+        pub fn destroy(self: *Self, index: usize) void {
+            const item_ptr: *Item = &self.items[index];
+            const int_ptr: *usize = @ptrCast(item_ptr);
+            int_ptr.* = self.next_free;
+            self.next_free = index;
+        }
+
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            if (use_vmem) {
+                vmemUnmapItems(Item, self.items);
+            } else {
+                gpa.free(self.items);
+            }
+        }
+    };
+}
+
+test "Indexed memory pool" {
+    const ta = testing.allocator;
+
+    const TestStruct = struct {
+        a: u64,
+        b: u64,
+    };
+
+    const PoolWithVmem = IndexedMemoryPool(TestStruct, true);
+    const PoolWithoutVmem = IndexedMemoryPool(TestStruct, false);
+
+    // Make sure values are created and freed in the correct order
+    var vmem_pool = try PoolWithVmem.initWithCapacity(null_allocator, 32);
+    defer vmem_pool.deinit(null_allocator);
+    try testing.expectEqual(0, vmem_pool.create(null_allocator));
+    try testing.expectEqual(1, vmem_pool.create(null_allocator));
+    try testing.expectEqual(2, vmem_pool.create(null_allocator));
+    vmem_pool.destroy(1);
+    vmem_pool.destroy(0);
+    try testing.expectEqual(0, vmem_pool.create(null_allocator));
+    try testing.expectEqual(1, vmem_pool.create(null_allocator));
+
+    // Make sure values are created and freed in the correct order
+    var pool = try PoolWithoutVmem.initWithCapacity(ta, 1);
+    defer pool.deinit(ta);
+    try testing.expectEqual(0, pool.create(ta));
+    try testing.expectEqual(1, pool.create(ta));
+    try testing.expectEqual(2, pool.create(ta));
+    pool.destroy(1);
+    pool.destroy(0);
+    try testing.expectEqual(0, pool.create(ta));
+    try testing.expectEqual(1, pool.create(ta));
 }

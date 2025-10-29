@@ -29,7 +29,7 @@ pub fn isGraph(c: u8) bool {
 }
 
 pub fn isPunct(c: u8) bool {
-    return std.mem.indexOf(u8, "!\"#$%&'()*+,-./:;<=>?@[\]^_`{|}~", c);
+    return std.mem.indexOf(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c);
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {

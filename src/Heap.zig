@@ -50,7 +50,7 @@ object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
-type_instances: CustomTypeInstanceList,
+type_instances: CustomTypeInstancePool,
 
 const Object = packed struct {
     pub const StrOrPtr = packed struct {
@@ -166,7 +166,6 @@ pub const Handle = packed struct {
     _padding: u1 = 0,
 };
 
-const HeapError = error{WrongHeap};
 pub const HeapId = u30;
 
 const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
@@ -175,8 +174,11 @@ const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
 const ObjectList = std.MultiArrayList(ObjectAndMetadata);
 const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
 const StringList = std.ArrayList(u8);
-const CustomTypeInstance = *anyopaque;
-const CustomTypeInstanceList = std.ArrayList(CustomTypeInstance);
+const CustomTypeInstance = struct {
+    first_ptr: *anyopaque,
+    second_ptr: *anyopaque,
+};
+const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
 
 const ObjectAndMetadata = struct {
     object: Object,
@@ -218,7 +220,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     }
     errdefer {
         if (cfg.use_vmem) {
-            memutil.vmemUnmap(@alignCast(objects.bytes[0..objects.capacity]));
+            memutil.vmemUnmap(@alignCast(objects.bytes[0..object_heap_max_bytes]));
         } else {
             objects.deinit(gpa);
         }
@@ -241,21 +243,9 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     errdefer if (cfg.use_vmem) memutil.vmemUnmap(@alignCast(strings.items)) else strings.deinit(gpa);
 
     // Init type instances
-    var type_instances: CustomTypeInstanceList = .{};
-    if (cfg.use_vmem) {
-        type_instances.items = try memutil.vmemMapItems(CustomTypeInstance, cfg.max_custom_type_instances);
-    } else if (cfg.threading) {
-        // if multithreading, we can't have strings moving around. We better allocate
-        // everything up front.
-        try type_instances.ensureTotalCapacity(gpa, cfg.max_custom_type_instances);
-    } else {
-        try type_instances.ensureTotalCapacity(gpa, 32);
-    }
-    errdefer if (cfg.use_vmem) {
-        memutil.vmemUnmapItems(CustomTypeInstance, @alignCast(type_instances.items));
-    } else {
-        type_instances.deinit(gpa);
-    };
+    const type_instances_capacity = if (cfg.threading) cfg.max_custom_type_instances else 32;
+    var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, type_instances_capacity);
+    errdefer type_instances.deinit(gpa);
 
     // Create heap
     var heap = Heap{
@@ -286,8 +276,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 pub fn deinit(self: *Heap) void {
     if (cfg.use_vmem) {
         memutil.vmemUnmap(@alignCast(self.strings.items));
-        memutil.vmemUnmap(@alignCast(self.objects.bytes[0..self.objects.capacity]));
-        memutil.vmemUnmapItems(CustomTypeInstance, self.type_instances.items);
+        memutil.vmemUnmap(@alignCast(self.objects.bytes[0..object_heap_max_bytes]));
     } else {
         // Don't use self.heapAlloc() in this case, as that will error
         // with the null allocator
@@ -296,6 +285,7 @@ pub fn deinit(self: *Heap) void {
     }
     self.object_tracking.deinit(self.gpa);
     self.string_tracking.deinit(self.gpa);
+    self.type_instances.deinit(self.gpa);
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -446,7 +436,8 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
             // How come string is a no-op? Because we could potentially
             // double-free when freeStringRep is called.
         },
-        .tiny_string, .none, .index, .number, .float => {},
+        .tiny_string, .none, .index, .number, .float, .bool => {},
+        .free => unreachable,
     }
 }
 
@@ -540,7 +531,7 @@ fn duplicateObjString(self: *Heap, handle: Handle) !Object.StrOrPtr {
 fn duplicateSingle(self: *Heap, handle: Handle) !Object {
     const src = peek(handle);
     switch (src.tag) {
-        .none, .index, .number, .float, .string, .tiny_string => {
+        .none, .index, .number, .float, .string, .tiny_string, .bool => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
@@ -567,7 +558,7 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = try self.createCustomTypeInstance(undefined),
+                        .index = @intCast(try self.type_instances.create(self.gpa)),
                         .type_id = custom_type.type_id,
                     },
                 },
@@ -579,6 +570,7 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
         .list => {
             @panic("duplicateSingle called with multi item object");
         },
+        .free => unreachable,
     }
 }
 
@@ -659,7 +651,26 @@ pub fn getString(handle: Handle) ![:0]const u8 {
 
 /// Get the string to modify (must not write any longer than current len).
 pub fn getStringMut(handle: Handle) ![:0]u8 {
-    return try getHeap(handle).getLocalString(handle.index);
+    const heap = getHeap(handle);
+    try heap.getLocalString(handle.index); // generate rep
+
+    const obj = heap.getLocalObject(handle.index);
+    switch (heap.getLocalStringDetails(handle.index)) {
+        .long => |long_str| {
+            return &long_str.string;
+        },
+        .normal => {
+            const str = obj.str.u.str;
+            return heap.strings.items[str.index..(str.index + str.len) :0];
+        },
+        .tiny => {
+            const as_bytes: *[7:0]u8 = @ptrCast(&obj.body.tiny_string.bytes);
+            return .{
+                .tiny = as_bytes[0..obj.str.u.str.len :0],
+            };
+        },
+        .null, .empty => return error.NotMutable,
+    }
 }
 
 /// Copies provided string.
@@ -767,7 +778,7 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
 const empty_string_value = "";
 /// This returns a temporary string. Whenever the object is modified, it
 /// may become invalid.
-fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]u8 {
+fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
     const obj: *Object = &self.objects.items(.object)[index];
 
     switch (self.getLocalStringDetails(index)) {
@@ -791,14 +802,14 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]u8 {
         .index => {
             new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.index}, 0);
         },
-        .return_code => {
-            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.return_code}, 0);
-        },
         .number => {
             new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.number}, 0);
         },
         .float => {
             new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{obj.body.float}, 0);
+        },
+        .bool => {
+            new_str = try std.fmt.allocPrintSentinel(self.gpa, "{}", .{@intFromBool(obj.body.bool)}, 0);
         },
         .list => {
             const list = obj.body.list;
@@ -814,6 +825,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]u8 {
         .string, .tiny_string, .none => {
             @panic("Tried to generate a string with no body");
         },
+        .free => unreachable,
     }
 
     const took_ownership = try self.setLocalString(index, new_str);
@@ -964,17 +976,6 @@ pub const LongString = struct {
         gpa.destroy(self);
     }
 };
-
-fn createCustomTypeInstance(self: *Heap, instance: CustomTypeInstance) !u32 {
-    const index = self.type_instances.items.len;
-    if ((cfg.use_vmem or cfg.threading) and index == cfg.max_custom_type_instances) {
-        // FIXME: handle this more gracefully, maybe make the return type optional
-        // or return an error?
-        @panic("Ran out of space for custom type instances");
-    }
-    try self.type_instances.append(self.heapAlloc(), instance);
-    return @intCast(index);
-}
 
 fn lockTracking(self: *Heap) void {
     if (self.heap_id == global_heap_id) self.tracking_mutex.lock();

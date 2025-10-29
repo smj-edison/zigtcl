@@ -114,7 +114,7 @@ pub const Parser = struct {
                     },
                     '[' => {
                         self.comment_possible = false;
-                        break :blk self.parseCommand();
+                        break :blk try self.parseCommand();
                     },
                     '$' => {
                         self.comment_possible = false;
@@ -127,7 +127,7 @@ pub const Parser = struct {
                                 token.loc.end = self.index;
                                 break :blk token;
                             } else {
-                                break :blk err;
+                                return err;
                             }
                         };
                     },
@@ -135,7 +135,7 @@ pub const Parser = struct {
                         if (self.comment_possible) {
                             _ = try self.parseComment();
                         } else {
-                            break :blk self.parseString();
+                            break :blk try self.parseString();
                         }
                     },
                     else => {
