@@ -29,7 +29,8 @@ pub fn isGraph(c: u8) bool {
 }
 
 pub fn isPunct(c: u8) bool {
-    return std.mem.indexOf(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", c);
+    _ = std.mem.indexOf(u8, "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", &[1]u8{c}) orelse return false;
+    return true;
 }
 
 fn toTitlecaseUtf8(cp: u21) u21 {
@@ -508,7 +509,7 @@ pub fn hexDigitValue(c: u8) ?u4 {
 }
 
 pub fn isHexDigit(c: u8) bool {
-    hexDigitValue(c) orelse return false;
+    _ = hexDigitValue(c) orelse return false;
     return true;
 }
 

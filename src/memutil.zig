@@ -298,7 +298,7 @@ pub fn IndexedMemoryPool(comptime Item: type, comptime use_vmem: bool) type {
 
         // Make sure we have enough space for a usize.
         const node_align = std.mem.Alignment.of(usize).max(.of(Item));
-
+        /// Designed to use items directly. May move locations after calling `.create()`.
         items: []align(node_align.toByteUnits()) Item,
         /// If == no_next_free, it doesn't point to anything
         next_free: usize = no_next_free,

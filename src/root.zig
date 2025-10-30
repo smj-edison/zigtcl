@@ -1,6 +1,6 @@
 const std = @import("std");
 const zigtcl = @import("zigtcl.zig");
-const Parser = @import("parser.zig").Parser;
+const Parser = @import("Parser.zig");
 const stringutil = @import("stringutil.zig");
 
 pub fn main() !void {
@@ -17,6 +17,7 @@ pub fn main() !void {
 test {
     // @import("std").testing.refAllDecls(@This());
     _ = @import("stringutil.zig");
-    _ = @import("parser.zig");
+    _ = @import("Parser.zig");
+    _ = @import("object.zig");
     _ = @import("Heap.zig");
 }

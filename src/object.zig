@@ -1,11 +1,171 @@
-//! Common objects and their functions.
 const std = @import("std");
 const assert = std.debug.assert;
+const Io = std.Io;
 
 const options = @import("options");
 const stringutil = @import("./stringutil.zig");
-const Heap = @import("Heap.zig");
+const Heap = @import("./Heap.zig");
+const Parser = @import("./Parser.zig");
 const Handle = Heap.Handle;
+
+pub const ErrorDetails = struct {
+    message: Handle,
+};
+
+fn printWithObjects(w: *Io.Writer, comptime fmt: []const u8, args: anytype) Io.Writer.Error!void {
+    // Shamelessly stolen from std.Io.Writer.print
+
+    const ArgsType = @TypeOf(args);
+    const args_type_info = @typeInfo(ArgsType);
+    if (args_type_info != .@"struct") {
+        @compileError("expected tuple or struct argument, found " ++ @typeName(ArgsType));
+    }
+
+    const fields_info = args_type_info.@"struct".fields;
+    const max_format_args = @typeInfo(std.fmt.ArgSetType).int.bits;
+    if (fields_info.len > max_format_args) {
+        @compileError("32 arguments max are supported per format call");
+    }
+
+    @setEvalBranchQuota(fmt.len * 1000);
+    comptime var arg_state: std.fmt.ArgState = .{ .args_len = fields_info.len };
+    comptime var i = 0;
+    comptime var literal: []const u8 = "";
+    inline while (true) {
+        const start_index = i;
+
+        inline while (i < fmt.len) : (i += 1) {
+            switch (fmt[i]) {
+                '{', '}' => break,
+                else => {},
+            }
+        }
+
+        comptime var end_index = i;
+        comptime var unescape_brace = false;
+
+        // Handle {{ and }}, those are un-escaped as single braces
+        if (i + 1 < fmt.len and fmt[i + 1] == fmt[i]) {
+            unescape_brace = true;
+            // Make the first brace part of the literal...
+            end_index += 1;
+            // ...and skip both
+            i += 2;
+        }
+
+        literal = literal ++ fmt[start_index..end_index];
+
+        // We've already skipped the other brace, restart the loop
+        if (unescape_brace) continue;
+
+        // Write out the literal
+        if (literal.len != 0) {
+            try w.writeAll(literal);
+            literal = "";
+        }
+
+        if (i >= fmt.len) break;
+
+        if (fmt[i] == '}') {
+            @compileError("missing opening {");
+        }
+
+        // Get past the {
+        comptime assert(fmt[i] == '{');
+        i += 1;
+
+        const fmt_begin = i;
+        // Find the closing brace
+        inline while (i < fmt.len and fmt[i] != '}') : (i += 1) {}
+        const fmt_end = i;
+
+        if (i >= fmt.len) {
+            @compileError("missing closing }");
+        }
+
+        // Get past the }
+        comptime assert(fmt[i] == '}');
+        i += 1;
+
+        const placeholder_array = fmt[fmt_begin..fmt_end].*;
+        const placeholder = comptime std.fmt.Placeholder.parse(&placeholder_array);
+        const arg_pos = comptime switch (placeholder.arg) {
+            .none => null,
+            .number => |pos| pos,
+            .named => |arg_name| std.meta.fieldIndex(ArgsType, arg_name) orelse
+                @compileError("no argument with name '" ++ arg_name ++ "'"),
+        };
+
+        const width = switch (placeholder.width) {
+            .none => null,
+            .number => |v| v,
+            .named => |arg_name| blk: {
+                const arg_i = comptime std.meta.fieldIndex(ArgsType, arg_name) orelse
+                    @compileError("no argument with name '" ++ arg_name ++ "'");
+                _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
+                break :blk @field(args, arg_name);
+            },
+        };
+
+        const precision = switch (placeholder.precision) {
+            .none => null,
+            .number => |v| v,
+            .named => |arg_name| blk: {
+                const arg_i = comptime std.meta.fieldIndex(ArgsType, arg_name) orelse
+                    @compileError("no argument with name '" ++ arg_name ++ "'");
+                _ = comptime arg_state.nextArg(arg_i) orelse @compileError("too few arguments");
+                break :blk @field(args, arg_name);
+            },
+        };
+
+        const arg_to_print = comptime arg_state.nextArg(arg_pos) orelse
+            @compileError("too few arguments");
+
+        if (placeholder.specifier_arg.len == 1 and placeholder.specifier_arg[0] == 'O') {
+            // TODO implement other settings
+            const obj_bytes = Heap.getString(@field(args, fields_info[arg_to_print].name)) catch null;
+            if (obj_bytes) |unwrapped| {
+                try w.writeAll(unwrapped);
+            } else {
+                try w.writeAll("<oom string>");
+            }
+        } else {
+            try w.printValue(
+                placeholder.specifier_arg,
+                .{
+                    .fill = placeholder.fill,
+                    .alignment = placeholder.alignment,
+                    .width = width,
+                    .precision = precision,
+                },
+                @field(args, fields_info[arg_to_print].name),
+                std.options.fmt_max_depth,
+            );
+        }
+    }
+
+    if (comptime arg_state.hasUnusedArgs()) {
+        const missing_count = arg_state.args_len - @popCount(arg_state.used_args);
+        switch (missing_count) {
+            0 => unreachable,
+            1 => @compileError("unused argument in '" ++ fmt ++ "'"),
+            else => @compileError(std.fmt.comptimePrint("{d}", .{missing_count}) ++ " unused arguments in '" ++ fmt ++ "'"),
+        }
+    }
+}
+
+pub fn allocPrintWithObjects(
+    gpa: std.mem.Allocator,
+    comptime fmt: []const u8,
+    args: anytype,
+) std.mem.Allocator.Error![:0]u8 {
+    var aw = try Io.Writer.Allocating.initCapacity(gpa, fmt.len);
+    defer aw.deinit();
+    printWithObjects(&aw.writer, fmt, args) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+    };
+    return aw.toOwnedSliceSentinel(0);
+}
 
 pub fn shimmerToString(handle: Handle) !void {
     assert(Heap.canShimmer(handle));
@@ -16,15 +176,15 @@ pub fn shimmerToString(handle: Handle) !void {
     const obj = Heap.peek(handle);
     if (str.len <= 7) {
         // Tiny string optimization
-        var tiny_str: [8]u8 = 0 ** 8;
-        const tiny_str_len = str.len;
+        var tiny_str = [1]u8{0} ** 8;
+        const tiny_str_len: u26 = @intCast(str.len);
         for (0..str.len) |i| tiny_str[i] = str[i];
 
         Heap.invalidateString(handle);
 
         obj.str = .{
             .is_ptr = false,
-            .u = .{ .str = .{ .index = 0, .length = tiny_str_len } },
+            .u = .{ .str = .{ .index = 0, .len = tiny_str_len } },
         };
         obj.tag = .tiny_string;
         obj.body.tiny_string = .{
@@ -80,12 +240,13 @@ pub fn getCodepointLength(handle: *Handle) !usize {
 /// Copies provided string.
 pub fn newString(heap: *Heap, bytes: [:0]const u8) !Handle {
     const str = try heap.createObject();
-    Heap.setString(str, bytes);
-    shimmerToString(str);
+    try Heap.setString(str, bytes);
+    try shimmerToString(str);
     return str;
 }
 
 pub fn newStringToFill(self: *Heap, len: usize) !Handle {
+    // TODO this can be optimized with fewer allocations
     const handle = try self.createObject();
 
     // create new string
@@ -154,14 +315,10 @@ pub const Range = struct {
     start: usize,
     end: usize,
 
-    pub fn fromObjects(list_len: usize, start: *Handle, end: *Handle) !?Range {
+    pub fn fromObjects(det: *ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !?Range {
         // Make sure we can distinguish between which input is the error.
-        const start_idx = try getIndex(start) catch |e| {
-            if (e == error.BadIndex) return error.BadStartIndex else return e;
-        };
-        const end_idx = try getIndex(end) catch |e| {
-            if (e == error.BadIndex) return error.BadEndIndex else return e;
-        };
+        const start_idx = try getIndex(start, det);
+        const end_idx = try getIndex(end, det);
 
         return constrainRange(list_len, .{
             .start = start_idx,
@@ -179,33 +336,47 @@ pub fn constrainRange(list_len: usize, range: Range) ?Range {
     return range;
 }
 
-pub fn getIndex(handle: *Handle) !Heap.ListIndex {
+/// Sets the details to a bad index message, and returns error.BadIndex.
+fn badIndex(det: *ErrorDetails, handle: Handle) !void {
+    const heap = Heap.getHeap(handle);
+    det.* = .{
+        .message = try newString(heap, allocPrintWithObjects(
+            heap.gpa,
+            "bad index \"{O}\": must be intexpr or end?[+-]intexpr?",
+            .{handle},
+        )),
+    };
+
+    return error.BadIndex;
+}
+
+pub fn getIndex(det: *ErrorDetails, handle: *Handle) !Heap.ListIndex {
     const obj = Heap.peek(*handle);
 
     // Fast case: if it's an integer or float, we can quickly cast it (don't
     // shimmer though, as it'll probably used for its original purpose still)
     if (obj.tag == .number) {
-        if (obj.body.number < 0) return error.BadIndex;
-        if (obj.body.number > std.math.maxInt(u32)) return error.BadIndex;
+        if (obj.body.number < 0) return badIndex(det, handle);
+        if (obj.body.number > std.math.maxInt(u32)) return badIndex(det, handle);
 
         return .{ .u = .{ .index = @intCast(obj.body.number) }, .is_end = false };
     } else if (obj.tag == .float) {
         const value = obj.body.float;
 
-        if (std.math.isNan(value)) return error.BadIndex;
-        if (value < 0) return error.BadIndex;
-        if (value > std.math.maxInt(u32)) return error.BadIndex;
+        if (std.math.isNan(value)) return badIndex(det, handle);
+        if (value < 0) return badIndex(det, handle);
+        if (value > std.math.maxInt(u32)) return badIndex(det, handle);
 
         return .{ .u = .{ .index = @intFromFloat(obj.body.number) }, .is_end = false };
     }
 
     if (obj.tag != .index) {
         if (Heap.canShimmer(*handle)) {
-            try shimmerToIndex(handle);
+            try shimmerToIndex(det, handle);
             return obj.body.index;
         } else {
             handle.* = Heap.getHeap(handle).duplicate(handle);
-            try shimmerToIndex(handle);
+            try shimmerToIndex(det, handle);
             return Heap.peek(*handle).body.index;
         }
     } else {
@@ -214,7 +385,7 @@ pub fn getIndex(handle: *Handle) !Heap.ListIndex {
 }
 
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(handle: Handle) !void {
+pub fn shimmerToIndex(det: *ErrorDetails, handle: Handle) !void {
     assert(Heap.canShimmer(handle));
 
     const bytes = try Heap.getString(handle);
@@ -223,15 +394,19 @@ pub fn shimmerToIndex(handle: Handle) !void {
     // Does it start with "end"? If so, it might be end+5, or end-2, etc
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
         if (bytes.len >= 4) {
-            if (bytes[3] != '+' or bytes[3] != '-') return error.BadIndex;
+            if (bytes[3] != '+' or bytes[3] != '-') return badIndex(det, handle);
 
-            const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch return error.BadIndex;
+            const index_offset = std.fmt.parseInt(i33, bytes[3..], 10) catch {
+                return badIndex(det, handle);
+            };
             obj.body.index = .{ .u = .{ .end_offset = index_offset }, .is_end = true };
         }
 
         obj.body.index = Heap.ListIndex.end;
     } else {
-        const index = std.fmt.parseInt(u32, bytes, 10) catch return error.BadIndex;
+        const index = std.fmt.parseInt(u32, bytes, 10) catch {
+            return badIndex(det, handle);
+        };
         obj.body.index = index;
     }
 
@@ -240,11 +415,11 @@ pub fn shimmerToIndex(handle: Handle) !void {
 
 /// Creates a substring of the passed in string. Creates it in `str`'s
 /// heap. Used in `[string range]`.
-pub fn stringRange(str: *Handle, start: *Handle, end: *Handle) !Handle {
+pub fn stringRange(det: *ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str);
 
-    const unchecked_range = try Range.fromObjects(codepoint_len, start, end);
+    const unchecked_range = try Range.fromObjects(det, codepoint_len, start, end);
     if (unchecked_range) |range| {
         // cpIndex is generic across ascii or utf8.
         const byte_start = stringutil.cpIndex(bytes, range.start);
@@ -444,9 +619,107 @@ pub fn stringTrim(str: Handle, trim_chars: Handle) !Handle {
     }
 }
 
+fn enumNamesCount(comptime T: type) usize {
+    comptime {
+        var result_size = 0;
+        for (std.meta.fields(T)) |field| {
+            result_size += field.name.len;
+        }
+        // Be sure to account for ", "
+        result_size += ((std.meta.fields(T).len) -| 1) * 2;
+
+        return result_size;
+    }
+}
+
+/// Enum names joined by ", "
+pub inline fn enumNames(comptime T: type) *const [enumNamesCount(T):0]u8 {
+    comptime {
+        // Fill the buffer
+        var buf: [enumNamesCount(T):0]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+
+        var first_time = true;
+        for (std.meta.fields(T)) |field| {
+            if (!first_time) {
+                w.writeAll(", ") catch unreachable;
+            } else first_time = false;
+
+            w.writeAll(field.name) catch unreachable;
+        }
+
+        buf[buf.len] = 0;
+
+        const final = buf;
+        return &final;
+    }
+}
+
+pub fn EnumMapping(comptime T: type) type {
+    comptime {
+        const field_count = std.meta.fields(T).len;
+
+        // Create an entry type (instantiated as .{ "foo", .foo })
+        const EntryType = std.meta.Tuple(&[_]type{ [:0]const u8, T });
+        // Repeat that type for how many fields there are
+        const entries = [1]type{EntryType} ** field_count;
+        // Create a map type with those repeated entries
+        const Mapping = std.meta.Tuple(&entries);
+
+        // Fill out the map
+        var mapping: Mapping = undefined;
+        for (std.meta.fields(T), 0..) |variant, i| {
+            const entry: EntryType = .{ variant.name, @enumFromInt(variant.value) };
+            @field(mapping, std.fmt.comptimePrint("{}", .{i})) = entry;
+        }
+
+        // Create the table
+        return struct {
+            pub const StaticStringMap = std.StaticStringMap(T);
+
+            map: StaticStringMap = StaticStringMap.initComptime(mapping),
+        };
+    }
+}
+
+pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
+    return struct {
+        pub const variants = T;
+        pub const map = (EnumMapping(T){}).map;
+        pub const names = enumNames(T);
+
+        pub fn get(det: *ErrorDetails, value: *Handle) !T {
+            const bytes = try Heap.getString(value.*);
+            const variant = map.get(bytes);
+            if (variant) |unwrapped| {
+                return unwrapped;
+            } else {
+                const heap = Heap.getHeap(value.*);
+                const message = try allocPrintWithObjects(
+                    heap.gpa,
+                    "bad {s} \"{O}\": must be {s}",
+                    .{ enum_name, value.*, names },
+                );
+                defer heap.gpa.free(message);
+                det.* = .{ .message = try newString(heap, message) };
+
+                return error.BadEnumVariant;
+            }
+        }
+    };
+}
+
+test "Tcl enum" {
+    const Things = enum { foo, bar, baz };
+    const map = (EnumMapping(Things){}).map;
+    const names = enumNames(Things);
+    try std.testing.expectEqual(Things.foo, map.get("foo"));
+    try std.testing.expectEqualSlices(u8, "foo, bar, baz", names);
+}
+
 /// Runs a string check based on requested class.
-pub fn stringIs(str: *Handle, class_to_check: *Handle, strict: bool) !bool {
-    const Classes = enum {
+pub fn stringIs(det: *ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
+    const Class = TclEnum(enum {
         integer,
         alpha,
         alnum,
@@ -462,44 +735,26 @@ pub fn stringIs(str: *Handle, class_to_check: *Handle, strict: bool) !bool {
         graph,
         punct,
         boolean,
-    };
-    const Mapping = std.StaticStringMap(Classes).initComptime(.{
-        .{ "integer", .integer },
-        .{ "alpha", .alpha },
-        .{ "alnum", .alnum },
-        .{ "ascii", .ascii },
-        .{ "digit", .digit },
-        .{ "double", .double },
-        .{ "lower", .lower },
-        .{ "upper", .upper },
-        .{ "space", .space },
-        .{ "xdigit", .xdigit },
-        .{ "control", .control },
-        .{ "print", .print },
-        .{ "graph", .graph },
-        .{ "punct", .punct },
-        .{ "boolean", .boolean },
-    });
+    }, "class");
 
-    const class_bytes = try Heap.getString(class_to_check);
-    const class = Mapping.get(class_bytes) orelse return error.BadEnumVariant;
+    const class = try Class.get(det, class_to_check);
 
-    const bytes = try Heap.getString(*str);
-    if (bytes.length == 0) {
+    const bytes = try Heap.getString(str.*);
+    if (bytes.len == 0) {
         return !strict;
     }
 
     switch (class) {
         .integer => {
-            std.fmt.parseInt(i64, bytes, 0) catch return false;
+            _ = std.fmt.parseInt(i64, bytes, 0) catch return false;
             return true;
         },
         .double => {
-            std.fmt.parseFloat(f64, bytes) catch return false;
+            _ = std.fmt.parseFloat(f64, bytes) catch return false;
             return true;
         },
         .boolean => {
-            getBoolean(str) catch return false;
+            _ = getBoolean(str) catch return false;
             return true;
         },
         .alpha => return stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
@@ -517,6 +772,90 @@ pub fn stringIs(str: *Handle, class_to_check: *Handle, strict: bool) !bool {
     }
 }
 
+test "String is" {
+    const ta = std.testing.allocator;
+    const heap = try Heap.createHeap(ta);
+    defer Heap.deinitAll();
+
+    var str = try newString(heap, "abcdefg");
+    var str2 = try newString(heap, "abcdefg123");
+    var class = try newString(heap, "alpha");
+    var bad_class = try newString(heap, "bad_class");
+    var details: ErrorDetails = undefined;
+
+    try std.testing.expectEqual(true, try stringIs(&details, &str, &class, false));
+    try std.testing.expectEqual(false, try stringIs(&details, &str2, &class, false));
+    try std.testing.expectError(error.BadEnumVariant, stringIs(&details, &str, &bad_class, false));
+    try std.testing.expectEqualSlices(
+        u8,
+        "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
+            "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
+        try Heap.getString(details.message),
+    );
+}
+
+pub fn shimmerToScript(det: *ErrorDetails, obj: Handle) !void {
+    const heap = Heap.getHeap(obj);
+    const bytes = try Heap.getString(obj);
+    var parser = Parser.init(bytes);
+
+    const gpa = Heap.getHeap(obj).gpa;
+
+    // This arena is responsible for all items allocated in this script
+    const arena_container = std.heap.ArenaAllocator.init(gpa);
+    var arena = arena_container.allocator();
+    errdefer arena_container.deinit();
+
+    var tokens = try std.ArrayList(Heap.TokenAndValue).initCapacity(gpa, 32);
+    while (true) {
+        const next_token = parser.parseScript();
+        if (next_token) |token| {
+            switch (token.tag) {
+                .simple_string => {
+                    const arena_str = try arena.dupeZ(u8, bytes[token.loc.start..token.loc.end]);
+                    try tokens.append(gpa, .{
+                        .token = .simple_string,
+                        .value = .{ .str = arena_str },
+                    });
+                },
+                .escaped_string => {
+                    const max_len = token.loc.end - token.loc.start;
+                    const dest = try gpa.allocSentinel(u8, max_len, 0);
+                    defer gpa.free(dest);
+
+                    const new_len = stringutil.removeEscaping(bytes[token.loc.start..token.loc.end], dest);
+                    const arena_str = arena.allocSentinel(u8, new_len, 0);
+
+                    try tokens.append(gpa, .{
+                        .token = .simple_string,
+                        .value = .{ .str = arena_str },
+                    });
+                },
+            }
+        } else |err| {
+            switch (err) {
+                error.CharactersAfterCloseBrace => {
+                    det.* = .{ .message = try newString(heap, "extra characters after close-brace") };
+                },
+                error.MissingCloseBrace => {
+                    det.* = .{ .message = try newString(heap, "missing close-brace") };
+                },
+                error.MissingCloseBracket => {
+                    det.* = .{ .message = try newString(heap, "unmatched \"[\"") };
+                },
+                error.MissingCloseQuote => {
+                    det.* = .{ .message = try newString(heap, "missing quote") };
+                },
+                error.TrailingBackslash => {
+                    det.* = .{ .message = try newString(heap, "no character after \\") };
+                },
+                error.OutOfMemory => return err,
+                error.NotVariable => unreachable,
+            }
+        }
+    }
+}
+
 pub fn shimmerToBoolean(obj: Handle) !void {
     assert(Heap.canShimmer(obj));
 
@@ -526,7 +865,7 @@ pub fn shimmerToBoolean(obj: Handle) !void {
     });
 
     const bytes = try Heap.getString(obj);
-    const new_value = Mapping.get(bytes) catch return error.BadBoolean;
+    const new_value = Mapping.get(bytes) orelse return error.BadBoolean;
 
     const ref = Heap.peek(obj);
     ref.tag = .bool;
@@ -534,13 +873,13 @@ pub fn shimmerToBoolean(obj: Handle) !void {
 }
 
 pub fn getBoolean(obj: *Handle) !bool {
-    if (Heap.peek(*obj).tag != .bool) {
-        if (!Heap.canShimmer(obj)) {
-            obj.* = Heap.getHeap(*obj).duplicate(obj);
+    if (Heap.peek(obj.*).tag != .bool) {
+        if (!Heap.canShimmer(obj.*)) {
+            obj.* = try Heap.getHeap(obj.*).duplicate(obj.*);
         }
 
-        try shimmerToBoolean(obj);
+        try shimmerToBoolean(obj.*);
     }
 
-    return Heap.peek(*obj).body.bool;
+    return Heap.peek(obj.*).body.bool;
 }

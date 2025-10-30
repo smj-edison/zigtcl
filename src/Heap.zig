@@ -8,6 +8,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 
 const stringutil = @import("stringutil.zig");
 const memutil = @import("memutil.zig");
+const Parser = @import("Parser.zig");
 
 // These numbers are final, and can be depended on to be their current values
 const null_string = 0;
@@ -31,6 +32,8 @@ pub const HeapSettings = struct {
     max_heaps: usize = 128,
     /// Maximum number of custom type instances.
     max_custom_type_instances: u32 = 65536,
+    /// Maximum number of script instances.
+    max_scripts: u32 = 65536,
 };
 const cfg: HeapSettings = .{};
 
@@ -40,17 +43,61 @@ const object_heap_max_count: usize = @as(usize, 1) << cfg.object_heap_order;
 const object_heap_max_bytes: usize = ObjectList.capacityInBytes(object_heap_max_count);
 const string_heap_max_bytes: usize = @as(usize, 1) << cfg.string_heap_order;
 
-// Heap fields
 gpa: Allocator,
 heap_id: HeapId,
+/// Used whenever an allocation or free is happening
+mem_mgmt_mutex: Mutex = .{},
 
-/// Used to lock object_tracking and string_tracking
-tracking_mutex: Mutex = .{},
 object_tracking: ObjectTracker,
 objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
+
 type_instances: CustomTypeInstancePool,
+parsed_scripts: ParsedScriptPool,
+script_scratch: ScriptScratchPool,
+
+pub const HeapId = u30;
+const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
+
+const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
+const ObjectList = std.MultiArrayList(ObjectAndMetadata);
+
+const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
+const StringList = std.ArrayList(u8);
+
+const CustomTypeInstance = struct {
+    first_ptr: *anyopaque,
+    second_ptr: *anyopaque,
+};
+const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
+
+pub const TokenAndValue = struct {
+    token: Parser.Token.Tag,
+    value: union {
+        int: i32,
+        str: [:0]u8,
+    },
+};
+/// Immutable, and can be shared between threads.
+const ParsedScript = struct {
+    /// Arena backing everything in the ParsedScript (including tokens and filename)
+    arena: std.heap.ArenaAllocator,
+    /// Tokens array.
+    tokens: []TokenAndValue,
+    /// File name.
+    filename: [:0]u8,
+    /// Line number of the first line.
+    first_line: usize,
+    /// Ref count (starts at 1 when created).
+    ref_count: u32,
+};
+const ParsedScriptPool = memutil.IndexedMemoryPool(ParsedScript, cfg.use_vmem);
+/// Cannot be shared between threads.
+const ScriptScratch = struct {
+    scratch: []Object,
+};
+const ScriptScratchPool = memutil.IndexedMemoryPool(ScriptScratch, cfg.use_vmem);
 
 const Object = packed struct {
     pub const StrOrPtr = packed struct {
@@ -93,6 +140,8 @@ pub const Tag = enum(u5) {
     tiny_string,
     string,
     list,
+    source,
+    script,
     reference,
     custom_type,
     /// Used for tracking allocation
@@ -130,14 +179,25 @@ pub const Body = packed union {
         /// If = utf8_length > maxInt(u32), it means the length has not been determined
         utf8_length: u33,
     },
-    /// String of up to length 8
+    /// String of up to length 7 (need one more byte for :0)
     tiny_string: packed struct {
         /// Must be cast to [7:0]u8
         bytes: u64,
     },
+    source: packed struct {
+        /// Pointer to a nul-terminated string in the heap (we don't have
+        /// space to store the string length, and file names can't have
+        /// embedded nulls anyways)
+        file_name: u32,
+        line_no: u32,
+    },
     list: packed struct {
         start: u32,
         len: u32,
+    },
+    script: packed struct {
+        parsed: u32,
+        heap: HeapId,
     },
     reference: Handle,
     custom_type: packed struct {
@@ -153,9 +213,9 @@ comptime {
 pub const CustomType = struct {
     name: []u8, // Type name
     invalidate_body: *const fn (heap: *Heap, obj: *Object) void,
-    duplicate: *const fn (heap: *Heap, src: *const Object, dest: *Object) void,
+    duplicate: *const fn (heap: *Heap, src: *const Object, dest: *Object) Allocator.Error!void,
     get_string: *const fn (heap: *Heap, obj: *const Object) Allocator.Error![:0]u8,
-    make_immutable: *const fn (heap: *Heap, obj: *Object) void,
+    make_immutable: *const fn (heap: *Heap, obj: *Object) Allocator.Error!void,
 };
 
 pub const Handle = packed struct {
@@ -165,20 +225,6 @@ pub const Handle = packed struct {
     ref_counted: bool,
     _padding: u1 = 0,
 };
-
-pub const HeapId = u30;
-
-const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
-
-const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
-const ObjectList = std.MultiArrayList(ObjectAndMetadata);
-const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
-const StringList = std.ArrayList(u8);
-const CustomTypeInstance = struct {
-    first_ptr: *anyopaque,
-    second_ptr: *anyopaque,
-};
-const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
 
 const ObjectAndMetadata = struct {
     object: Object,
@@ -247,15 +293,25 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, type_instances_capacity);
     errdefer type_instances.deinit(gpa);
 
+    const scripts_capacity = if (cfg.threading) cfg.max_scripts else 32;
+    var parsed_scripts: ParsedScriptPool = try .initWithCapacity(gpa, scripts_capacity);
+    errdefer parsed_scripts.deinit(gpa);
+    var script_scratch: ScriptScratchPool = try .initWithCapacity(gpa, scripts_capacity);
+    errdefer script_scratch.deinit(gpa);
+
     // Create heap
     var heap = Heap{
         .gpa = gpa,
         .heap_id = heap_id,
+
         .object_tracking = object_tracking,
         .objects = objects,
         .string_tracking = string_tracking,
         .strings = strings,
+
         .type_instances = type_instances,
+        .parsed_scripts = parsed_scripts,
+        .script_scratch = script_scratch,
     };
 
     // Specialty objects
@@ -274,6 +330,12 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 }
 
 pub fn deinit(self: *Heap) void {
+    for (0..self.objects.len) |i| {
+        if (self.objects.get(i).object.tag != .free) {
+            self.freeLocalObject(@intCast(i));
+        }
+    }
+
     if (cfg.use_vmem) {
         memutil.vmemUnmap(@alignCast(self.strings.items));
         memutil.vmemUnmap(@alignCast(self.objects.bytes[0..object_heap_max_bytes]));
@@ -285,7 +347,10 @@ pub fn deinit(self: *Heap) void {
     }
     self.object_tracking.deinit(self.gpa);
     self.string_tracking.deinit(self.gpa);
+
     self.type_instances.deinit(self.gpa);
+    self.parsed_scripts.deinit(self.gpa);
+    self.script_scratch.deinit(self.gpa);
 }
 
 pub fn createObject(self: *Heap) !Handle {
@@ -300,11 +365,14 @@ pub fn createObject(self: *Heap) !Handle {
 /// create_objects does not initialize objects, but does initialize
 /// reference counts.
 pub fn createObjects(self: *Heap, count: u32) !u32 {
-    self.lockTracking();
     const order = memutil.getOrder(count);
+
+    self.mem_mgmt_mutex.lock();
+    errdefer self.mem_mgmt_mutex.unlock();
     const index: u32 = @intCast(try self.object_tracking.alloc(self.gpa, order));
+    self.mem_mgmt_mutex.unlock();
+
     const end = index + count;
-    self.unlockTracking();
 
     // Make sure arrays have space for new objects
     if (self.objects.len < index + count) {
@@ -367,9 +435,9 @@ fn freeLocalObject(self: *Heap, index: u32) void {
 
     const metadata = self.objects.get(index).metadata;
     if (metadata.is_alloc_head) {
-        self.lockTracking();
+        self.mem_mgmt_mutex.lock();
         self.object_tracking.free(index, metadata.order);
-        self.unlockTracking();
+        self.mem_mgmt_mutex.unlock();
     }
 }
 
@@ -436,6 +504,19 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
             // How come string is a no-op? Because we could potentially
             // double-free when freeStringRep is called.
         },
+        .script => {
+            const script = obj.body.script;
+            const parsed_script = &heaps[script.heap].parsed_scripts.items[script.parsed];
+            if (decrRefCountOf(usize, &parsed_script.ref_count)) {
+                parsed_script.arena.deinit();
+            }
+        },
+        .source => {
+            const source = obj.body.source;
+            const file_name_ptr = @as([*:0]u8, &self.strings.items[source.file_name]);
+            const file_name = std.mem.span(file_name_ptr);
+            self.freeString(source.file_name, file_name.len);
+        },
         .tiny_string, .none, .index, .number, .float, .bool => {},
         .free => unreachable,
     }
@@ -444,17 +525,17 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
 /// Allocates 1 + length, in order to make space for the null byte
 fn createString(self: *Heap, len: u32) !u32 {
     const length_with_null = len + 1;
-    self.lockTracking();
-    defer self.unlockTracking();
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
     const new_string: u32 = @intCast(try self.string_tracking.allocCount(self.gpa, length_with_null));
     return new_string;
 }
 
 fn freeString(self: *Heap, index: u32, len: u32) void {
     const length_with_null = len + 1;
-    self.lockTracking();
+    self.mem_mgmt_mutex.lock();
     self.string_tracking.freeCount(index, length_with_null);
-    self.unlockTracking();
+    self.mem_mgmt_mutex.unlock();
 }
 
 /// Increase ref count if possible, otherwise duplicate.
@@ -484,21 +565,7 @@ pub fn release(self: *Heap, handle: Handle) void {
     // This object may have come from another heap
     var heap = getHeap(handle);
 
-    // If after_sub == 0, then this object will be freed
-    var after_sub: u32 = undefined;
-    if (cfg.threading and heap.objects.get(handle.index).metadata.cross_thread) {
-        const before_sub = @atomicRmw(u32, &heap.objects.items(.ref_count)[handle.index], .Sub, 1, .release);
-        after_sub = before_sub - 1;
-
-        if (after_sub == 0) {
-            _ = @atomicLoad(u32, &heap.objects.items(.ref_count)[handle.index], .acquire);
-        }
-    } else {
-        heap.objects.items(.ref_count)[handle.index] -= 1;
-        after_sub = heap.objects.get(handle.index).ref_count;
-    }
-
-    if (after_sub == 0) {
+    if (decrRefCountOf(u32, &heap.objects.items(.ref_count)[handle.index])) {
         heap.freeLocalObject(handle.index);
     }
 }
@@ -554,16 +621,17 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
             const custom_type = src.body.custom_type;
 
             var new_object: Object = .{
+                // TODO make sure this doesn't leak
                 .str = try self.duplicateObjString(handle),
                 .tag = .custom_type,
                 .body = .{
                     .custom_type = .{
-                        .index = @intCast(try self.type_instances.create(self.gpa)),
+                        .index = try self.createCustomTypeInstance(),
                         .type_id = custom_type.type_id,
                     },
                 },
             };
-            custom_types[custom_type.type_id].duplicate(self, src, &new_object);
+            try custom_types[custom_type.type_id].duplicate(self, src, &new_object);
 
             return new_object;
         },
@@ -700,9 +768,10 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
     } else if (bytes.len < LongString.split_point) {
         const local_string = try self.createString(@intCast(bytes.len));
         @memcpy(
-            self.strings.items[local_string..(local_string + bytes.len) :0],
+            self.strings.items[local_string..(local_string + bytes.len)],
             bytes,
         );
+        self.strings.items[local_string + bytes.len] = 0;
 
         new_str_or_ptr.u.str = .{
             .index = local_string,
@@ -961,13 +1030,7 @@ pub const LongString = struct {
     }
 
     pub fn decrRefCount(self: *align(align_amt) LongString, gpa: Allocator) void {
-        if (cfg.threading) {
-            _ = @atomicRmw(usize, &self.ref_count, .Sub, 1, .monotonic);
-        } else {
-            self.ref_count -= 1;
-        }
-
-        if (self.ref_count == 0) {
+        if (decrRefCountOf(usize, &self.ref_count)) {
             self.freeUnchecked(gpa);
         }
     }
@@ -976,14 +1039,6 @@ pub const LongString = struct {
         gpa.destroy(self);
     }
 };
-
-fn lockTracking(self: *Heap) void {
-    if (self.heap_id == global_heap_id) self.tracking_mutex.lock();
-}
-
-fn unlockTracking(self: *Heap) void {
-    if (self.heap_id == global_heap_id) self.tracking_mutex.unlock();
-}
 
 pub const CustomTypes = struct {
     elem: [cfg.max_custom_types]CustomType = undefined,
@@ -1006,13 +1061,29 @@ pub const CustomTypes = struct {
     }
 };
 
+pub fn createCustomTypeInstance(self: *Heap) !u32 {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    const new_id = try self.type_instances.create(self.gpa);
+    if (new_id >= cfg.max_custom_type_instances) return error.OutOfMemory;
+
+    return @intCast(new_id);
+}
+
+/// `tokens` must be allocated by the allocator provided to heap. Takes ownership.
+pub fn createParsedScript(self: *Heap, script: ParsedScript) !void {
+    const index = try self.parsed_scripts.create(self.gpa);
+    self.parsed_scripts.items[index] = script;
+}
+
 // Heap instances //
 pub var heaps: [cfg.max_heaps]Heap = undefined;
 var next_open_heap: usize = 0;
 pub var custom_types: [cfg.max_custom_types]CustomType = undefined;
 var next_open_type: usize = 0;
 
-pub fn createHeap(gpa: Allocator) !?*Heap {
+pub fn createHeap(gpa: Allocator) !*Heap {
     var slot_index: usize = undefined;
     if (cfg.threading) {
         slot_index = @atomicRmw(usize, &next_open_heap, .Add, 1, .monotonic);
@@ -1025,7 +1096,7 @@ pub fn createHeap(gpa: Allocator) !?*Heap {
         heaps[slot_index] = try init(gpa, @intCast(slot_index));
         return &heaps[slot_index];
     } else {
-        return null;
+        return error.OutOfMemory;
     }
 }
 
@@ -1055,7 +1126,7 @@ pub fn createCustomType(custom_type: CustomType) ?*CustomType {
 
 test "Object duplication" {
     const ta = std.testing.allocator;
-    var heap = (try createHeap(ta)) orelse return error.TestUnexpectedResult;
+    var heap = try createHeap(ta);
     defer deinitAll();
 
     // Number object
@@ -1083,7 +1154,7 @@ test "Object duplication" {
 
 test "Get string" {
     const ta = std.testing.allocator;
-    var heap = (try createHeap(ta)) orelse return error.TestUnexpectedResult;
+    var heap = try createHeap(ta);
     defer deinitAll();
 
     const obj = try heap.createObject();
@@ -1106,3 +1177,22 @@ const DummyMutex = struct {
         _ = self;
     }
 };
+
+/// Returns true if count has reached zero. Multithreaded safe.
+/// Happens-after the previous decrement.
+pub fn decrRefCountOf(comptime T: type, ref: *T) bool {
+    var after_sub: T = undefined;
+    if (cfg.threading) {
+        const before_sub = @atomicRmw(T, ref, .Sub, 1, .release);
+        after_sub = before_sub - 1;
+
+        if (after_sub == 0) {
+            _ = @atomicLoad(u32, ref, .acquire);
+        }
+    } else {
+        ref -= 1;
+        after_sub = ref.*;
+    }
+
+    return after_sub == 0;
+}
