@@ -170,27 +170,11 @@ pub fn allocPrintWithObjects(
 pub fn shimmerToString(handle: Handle) !void {
     assert(Heap.canShimmer(handle));
 
-    const str = try Heap.getString(handle); // Generate string representation
-    Heap.invalidateBody(handle);
-
     const obj = Heap.peek(handle);
-    if (str.len <= 7) {
-        // Tiny string optimization
-        var tiny_str = [1]u8{0} ** 8;
-        const tiny_str_len: u26 = @intCast(str.len);
-        for (0..str.len) |i| tiny_str[i] = str[i];
+    _ = try Heap.getString(handle); // Ensure string representation
 
-        Heap.invalidateString(handle);
-
-        obj.str = .{
-            .is_ptr = false,
-            .u = .{ .str = .{ .index = 0, .len = tiny_str_len } },
-        };
-        obj.tag = .tiny_string;
-        obj.body.tiny_string = .{
-            .bytes = @bitCast(tiny_str),
-        };
-    } else {
+    if (obj.tag != .string) {
+        Heap.invalidateBody(handle);
         obj.tag = .string;
         obj.body.string = .{
             // Don't know the utf-8 length yet
@@ -231,9 +215,6 @@ pub fn getCodepointLength(handle: *Handle) !usize {
                 return utf8_length;
             }
         }
-    } else if (obj.tag == .tiny_string) {
-        // utf8 length is computed every time a tiny string is used
-        return stringutil.codepointLength(bytes);
     } else unreachable;
 }
 
@@ -246,7 +227,7 @@ pub fn newString(heap: *Heap, bytes: [:0]const u8) !Handle {
 }
 
 pub fn newStringToFill(self: *Heap, len: usize) !Handle {
-    // TODO this can be optimized with fewer allocations
+    // TODO PERF this can be optimized with fewer allocations
     const handle = try self.createObject();
 
     // create new string
@@ -273,10 +254,9 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
             obj.body.string.utf8_length = cp_length;
         },
         .empty => {
-            obj.body.string.utf8_length = 0;
-        },
-        .tiny => {
-            // Tiny string has utf8 length calculated every access
+            obj.body.string = .{
+                .utf8_length = 0,
+            };
         },
         .null => unreachable,
     }
@@ -882,4 +862,73 @@ pub fn getBoolean(obj: *Handle) !bool {
     }
 
     return Heap.peek(obj.*).body.bool;
+}
+
+/// Source information for an object
+pub const SourceInfo = struct {
+    filename_ref: [:0]const u8,
+    line_no: u32,
+};
+
+/// Get source information (filename and line number) from an object.
+/// Returns a SourceInfo struct if the object has source information,
+/// or null if the object has no source information.
+pub fn getSourceInfo(obj: Handle) ?SourceInfo {
+    const heap = Heap.getHeap(obj);
+    const ref = Heap.peek(obj);
+
+    if (ref.tag != .source) return null;
+
+    return .{
+        .filename_ref = heap.getHeapStringZ(ref.body.source.file_name),
+        .line_no = ref.body.source.line_no,
+    };
+}
+
+/// Set source information (filename and line number) on an object.
+/// This associates the object with a specific location in source code.
+pub fn setSourceInfo(obj: Handle, filename: [:0]const u8, line_no: u32) !void {
+    const heap = Heap.getHeap(obj);
+    const ref = Heap.peek(obj);
+
+    Heap.invalidateBody(obj);
+
+    // Allocate space for the filename string
+    const len: u32 = @intCast(filename.len);
+    const file_name_index = try heap.createString(len);
+    errdefer heap.freeString(file_name_index, len);
+
+    // Copy the filename
+    @memcpy(heap.getHeapString(file_name_index, file_name_index + len), filename);
+
+    // Set the object as a source type
+    ref.tag = .source;
+    ref.body.source.file_name = file_name_index;
+    ref.body.source.line_no = line_no;
+}
+
+test "Source info" {
+    const ta = std.testing.allocator;
+    const heap = try Heap.createHeap(ta);
+    defer Heap.deinitAll();
+
+    // Create an object and set source info
+    const obj = try heap.createObject();
+    try setSourceInfo(obj, "test_file.tcl", 42);
+
+    // Verify the object has the source tag
+    const ref = Heap.peek(obj);
+    try std.testing.expectEqual(.source, ref.tag);
+    try std.testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
+
+    // Get source info and verify it returns the correct data
+    const info = getSourceInfo(obj);
+    try std.testing.expect(info != null);
+    try std.testing.expectEqualSlices(u8, "test_file.tcl", info.?.filename_ref);
+    try std.testing.expectEqual(@as(u32, 42), info.?.line_no);
+
+    // Test getSourceInfo on an object without source info
+    const obj2 = try newString(heap, "hello");
+    const empty_info = getSourceInfo(obj2);
+    try std.testing.expect(empty_info == null);
 }

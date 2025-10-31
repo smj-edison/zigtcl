@@ -136,8 +136,6 @@ pub const Tag = enum(u5) {
     number,
     float,
     bool,
-    /// `.tiny_string` _must_ have at least one byte (e.g. not null and not empty)
-    tiny_string,
     string,
     list,
     source,
@@ -178,11 +176,6 @@ pub const Body = packed union {
     string: packed struct {
         /// If = utf8_length > maxInt(u32), it means the length has not been determined
         utf8_length: u33,
-    },
-    /// String of up to length 7 (need one more byte for :0)
-    tiny_string: packed struct {
-        /// Must be cast to [7:0]u8
-        bytes: u64,
     },
     source: packed struct {
         /// Pointer to a nul-terminated string in the heap (we don't have
@@ -468,7 +461,7 @@ fn invalidateLocalString(self: *Heap, index: u32) void {
         .normal => {
             self.freeString(obj.str.u.str.index, obj.str.u.str.len);
         },
-        .null, .empty, .tiny => {},
+        .null, .empty => {},
     }
 
     // Be sure to mark as having no string
@@ -507,31 +500,42 @@ fn invalidateLocalBody(self: *Heap, index: u32) void {
         .script => {
             const script = obj.body.script;
             const parsed_script = &heaps[script.heap].parsed_scripts.items[script.parsed];
-            if (decrRefCountOf(usize, &parsed_script.ref_count)) {
+            if (decrRefCountOf(u32, &parsed_script.ref_count)) {
                 parsed_script.arena.deinit();
             }
         },
         .source => {
             const source = obj.body.source;
-            const file_name_ptr = @as([*:0]u8, &self.strings.items[source.file_name]);
-            const file_name = std.mem.span(file_name_ptr);
-            self.freeString(source.file_name, file_name.len);
+            const file_name = self.getHeapStringZ(source.file_name);
+            self.freeString(source.file_name, @intCast(file_name.len));
         },
-        .tiny_string, .none, .index, .number, .float, .bool => {},
+        .none, .index, .number, .float, .bool => {},
         .free => unreachable,
     }
 }
 
+/// Get a string slice from heap string storage
+pub fn getHeapString(self: *Heap, start: u32, end: u32) [:0]u8 {
+    return self.strings.items[start..end :0];
+}
+
+/// Get a null-terminated string from heap string storage starting at index
+pub fn getHeapStringZ(self: *Heap, index: u32) [:0]u8 {
+    const ptr: [*:0]u8 = @ptrCast(&self.strings.items[index]);
+    return std.mem.span(ptr);
+}
+
 /// Allocates 1 + length, in order to make space for the null byte
-fn createString(self: *Heap, len: u32) !u32 {
+pub fn createString(self: *Heap, len: u32) !u32 {
     const length_with_null = len + 1;
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
     const new_string: u32 = @intCast(try self.string_tracking.allocCount(self.gpa, length_with_null));
+    self.strings.items[new_string + len] = 0;
     return new_string;
 }
 
-fn freeString(self: *Heap, index: u32, len: u32) void {
+pub fn freeString(self: *Heap, index: u32, len: u32) void {
     const length_with_null = len + 1;
     self.mem_mgmt_mutex.lock();
     self.string_tracking.freeCount(index, length_with_null);
@@ -581,15 +585,15 @@ fn duplicateObjString(self: *Heap, handle: Handle) !Object.StrOrPtr {
         },
         .normal => |bytes| {
             const new_string = try self.createString(@intCast(bytes.len));
-            @memcpy(self.strings.items[new_string..(new_string + bytes.len) :0], bytes);
+            const len: u26 = @intCast(bytes.len);
+            @memcpy(self.getHeapString(new_string, new_string + len), bytes);
 
             return .{
-                .u = .{ .str = .{ .index = new_string, .len = @intCast(bytes.len) } },
+                .u = .{ .str = .{ .index = new_string, .len = len } },
                 .is_ptr = false,
             };
         },
-        .tiny, .null, .empty => {
-            // Caller is responsible to copy the tiny string
+        .null, .empty => {
             return peek(handle).str;
         },
     }
@@ -598,11 +602,33 @@ fn duplicateObjString(self: *Heap, handle: Handle) !Object.StrOrPtr {
 fn duplicateSingle(self: *Heap, handle: Handle) !Object {
     const src = peek(handle);
     switch (src.tag) {
-        .none, .index, .number, .float, .string, .tiny_string, .bool => {
+        .none, .index, .number, .float, .string, .bool => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
                 .body = src.body,
+            };
+        },
+        .source => {
+            // Duplicate the source info, including the filename string
+            const source = src.body.source;
+            const file_name = self.getHeapStringZ(source.file_name);
+            const len: u26 = @intCast(file_name.len);
+
+            const new_file_name = try self.createString(len);
+            errdefer self.freeString(new_file_name, len);
+
+            @memcpy(self.getHeapString(new_file_name, new_file_name + len), file_name);
+
+            return .{
+                .str = try self.duplicateObjString(handle),
+                .tag = .source,
+                .body = .{
+                    .source = .{
+                        .file_name = new_file_name,
+                        .line_no = source.line_no,
+                    },
+                },
             };
         },
         .reference => {
@@ -637,6 +663,18 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
         },
         .list => {
             @panic("duplicateSingle called with multi item object");
+        },
+        .script => {
+            // Scripts are ref counted - increment the ref count
+            const script = src.body.script;
+            const parsed_script = &heaps[script.heap].parsed_scripts.items[script.parsed];
+            incrRefCountOf(u32, &parsed_script.ref_count);
+
+            return .{
+                .str = try self.duplicateObjString(handle),
+                .tag = .script,
+                .body = src.body,
+            };
         },
         .free => unreachable,
     }
@@ -729,13 +767,7 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
         },
         .normal => {
             const str = obj.str.u.str;
-            return heap.strings.items[str.index..(str.index + str.len) :0];
-        },
-        .tiny => {
-            const as_bytes: *[7:0]u8 = @ptrCast(&obj.body.tiny_string.bytes);
-            return .{
-                .tiny = as_bytes[0..obj.str.u.str.len :0],
-            };
+            return heap.getHeapString(str.index, str.index + str.len);
         },
         .null, .empty => return error.NotMutable,
     }
@@ -756,8 +788,7 @@ pub fn setString(handle: Handle, bytes: [:0]const u8) !void {
 fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
     var took_ownership = false;
 
-    // Figure out the best way to represent the string (tiny string is not
-    // an option as the body is already occupied with another type)
+    // Figure out the best way to represent the string
     var new_str_or_ptr: Object.StrOrPtr = undefined;
     if (bytes.len == 0) {
         new_str_or_ptr.u.str = .{
@@ -767,15 +798,15 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
         new_str_or_ptr.is_ptr = false;
     } else if (bytes.len < LongString.split_point) {
         const local_string = try self.createString(@intCast(bytes.len));
+        const len: u26 = @intCast(bytes.len);
         @memcpy(
-            self.strings.items[local_string..(local_string + bytes.len)],
+            self.getHeapString(local_string, local_string + len),
             bytes,
         );
-        self.strings.items[local_string + bytes.len] = 0;
 
         new_str_or_ptr.u.str = .{
             .index = local_string,
-            .len = @intCast(bytes.len),
+            .len = len,
         };
         new_str_or_ptr.is_ptr = false;
     } else {
@@ -854,7 +885,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         .long => |long_str| {
             return long_str.string;
         },
-        .normal, .tiny => |str| {
+        .normal => |str| {
             return str;
         },
         .empty => {
@@ -891,7 +922,10 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         .reference => {
             return getString(obj.body.reference);
         },
-        .string, .tiny_string, .none => {
+        .source, .script => {
+            @panic("Source and script objects should always have a string representation");
+        },
+        .string, .none => {
             @panic("Tried to generate a string with no body");
         },
         .free => unreachable,
@@ -960,7 +994,6 @@ fn getListString(self: *Heap, index: u32, len: u32) ![:0]u8 {
 const StringDetails = union(enum) {
     null: void,
     empty: void,
-    tiny: [:0]u8,
     normal: [:0]u8,
     long: *align(LongString.align_amt) LongString,
 };
@@ -971,16 +1004,6 @@ pub fn getStringDetails(handle: Handle) StringDetails {
 
 fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
     const obj = self.getLocalObject(index);
-
-    // Tiny string optimization?
-    if (obj.tag == .tiny_string) {
-        // Tiny strings are guaranteed to have at least one byte,
-        // so not null, and not empty.
-        const as_bytes: *[7:0]u8 = @ptrCast(&obj.body.tiny_string.bytes);
-        return .{
-            .tiny = as_bytes[0..obj.str.u.str.len :0],
-        };
-    }
 
     // Normal string or long string?
     if (obj.str.is_ptr) {
@@ -996,7 +1019,7 @@ fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
             return .empty;
         } else {
             return .{
-                .normal = self.strings.items[str.index..(str.index + str.len) :0],
+                .normal = self.getHeapString(str.index, str.index + str.len),
             };
         }
     }
@@ -1178,6 +1201,14 @@ const DummyMutex = struct {
     }
 };
 
+pub fn incrRefCountOf(comptime T: type, ref: *T) void {
+    if (cfg.threading) {
+        _ = @atomicRmw(T, ref, .Add, 1, .monotonic);
+    } else {
+        ref.* += 1;
+    }
+}
+
 /// Returns true if count has reached zero. Multithreaded safe.
 /// Happens-after the previous decrement.
 pub fn decrRefCountOf(comptime T: type, ref: *T) bool {
@@ -1187,10 +1218,10 @@ pub fn decrRefCountOf(comptime T: type, ref: *T) bool {
         after_sub = before_sub - 1;
 
         if (after_sub == 0) {
-            _ = @atomicLoad(u32, ref, .acquire);
+            _ = @atomicLoad(T, ref, .acquire);
         }
     } else {
-        ref -= 1;
+        ref.* -= 1;
         after_sub = ref.*;
     }
 

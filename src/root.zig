@@ -1,5 +1,5 @@
 const std = @import("std");
-const zigtcl = @import("zigtcl.zig");
+const zicl = @import("zicl.zig");
 const Parser = @import("Parser.zig");
 const stringutil = @import("stringutil.zig");
 
