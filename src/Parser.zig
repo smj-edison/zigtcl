@@ -13,7 +13,8 @@ const options = @import("options");
 const Parser = @This();
 
 buffer: []const u8,
-index: usize,
+index: u32,
+line_no: u32,
 /// We need to keep track of whether we're in a quote or not across `next`
 /// invocations, because something like `set x "hello[set world]!"` emits
 /// three tokens.
@@ -22,9 +23,9 @@ in_quote: bool,
 /// next token to be a comment (set to true after newline or semicolon).
 comment_possible: bool,
 last_token_type: Token.Tag,
-error_details: ?struct { index: usize },
+error_details: ?struct { index: u32, line_no: u32 },
 
-const Error = error{
+pub const Error = error{
     MissingCloseBracket,
     MissingCloseBrace,
     MissingCloseQuote,
@@ -38,8 +39,9 @@ pub const Token = struct {
     loc: Location,
 
     pub const Location = struct {
-        start: usize,
-        end: usize,
+        start: u32,
+        end: u32,
+        line_no: u32,
     };
 
     pub const Tag = enum(u8) {
@@ -49,8 +51,9 @@ pub const Token = struct {
         simple_string,
         /// String that needs escape character conversion
         escaped_string,
-        /// Argument expansion, e.g. {*}
-        argument_expansion,
+        /// String that was in braces (important to disambiguate between "*" and {*} for
+        /// argument expansion)
+        braced_string,
         /// Variable substitution
         variable_subst,
         /// Syntax sugar for [dict get], $foo(bar)
@@ -74,6 +77,7 @@ pub fn init(buffer: []const u8) Parser {
     return .{
         .buffer = buffer,
         .index = 0,
+        .line_no = 1,
         .in_quote = false,
         .comment_possible = true,
         .last_token_type = .none,
@@ -163,6 +167,7 @@ pub fn parseScript(self: *Parser) Error!Token {
             .loc = .{
                 .start = self.index,
                 .end = self.index,
+                .line_no = self.line_no,
             },
         };
     }
@@ -182,6 +187,7 @@ pub fn parseString(self: *Parser) !Token {
                     // if it's not matched.
                     self.error_details = .{
                         .index = self.index,
+                        .line_no = self.line_no,
                     };
                     self.advance(1);
                 },
@@ -274,6 +280,7 @@ pub fn parseString(self: *Parser) !Token {
 pub fn parseQuote(self: *Parser) !Token {
     // save for potential error message later if there's a missing close quote
     const index = self.index;
+    const line_no = self.line_no;
 
     // skip the quote
     self.advance(1);
@@ -317,6 +324,7 @@ pub fn parseQuote(self: *Parser) !Token {
     // finding a closing quote.
     self.error_details = .{
         .index = index,
+        .line_no = line_no,
     };
     return Error.MissingCloseQuote;
 }
@@ -346,6 +354,7 @@ pub fn parseVariable(self: *Parser) !Token {
     // Braced variable? (e.g. ${foo})
     if (self.current() == '{') {
         const brace_index = self.index;
+        const brace_line_no = self.line_no;
 
         self.advance(1);
         // set new token location to inside the brace
@@ -363,6 +372,7 @@ pub fn parseVariable(self: *Parser) !Token {
         if (!found_closing_brace) {
             self.error_details = .{
                 .index = brace_index,
+                .line_no = brace_line_no,
             };
             return Error.MissingCloseBrace;
         }
@@ -451,6 +461,7 @@ pub fn parseVariable(self: *Parser) !Token {
 pub fn parseCommand(self: *Parser) Error!Token {
     // Save in case the bracket is not matched for better error message.
     const index = self.index;
+    const line_no = self.line_no;
 
     // Skip opening '['
     self.advance(1);
@@ -510,6 +521,7 @@ pub fn parseCommand(self: *Parser) Error!Token {
     // is needed.
     self.error_details = .{
         .index = index,
+        .line_no = line_no,
     };
     return Error.MissingCloseBracket;
 }
@@ -518,13 +530,14 @@ pub fn parseBrace(self: *Parser) !Token {
     // Save the current line in case the braces are mismatched (so we can point
     // right to where the problem is)
     const index = self.index;
+    const line_no = self.line_no;
 
     // Skip '{'
     self.advance(1);
     var brace_depth: usize = 1;
 
     var token = self.newToken();
-    token.tag = .simple_string;
+    token.tag = .braced_string;
 
     while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
@@ -546,10 +559,6 @@ pub fn parseBrace(self: *Parser) !Token {
                         }
                     }
 
-                    if (token.loc.end - token.loc.start == 1 and self.buffer[token.loc.start] == '*') {
-                        token.tag = .argument_expansion;
-                    }
-
                     // make sure to point at after the closing brace
                     self.advance(1);
 
@@ -569,6 +578,7 @@ pub fn parseBrace(self: *Parser) !Token {
     // our braces being balanced. As such, we should error.
     self.error_details = .{
         .index = index,
+        .line_no = line_no,
     };
     return Error.MissingCloseBrace;
 }
@@ -637,6 +647,7 @@ pub fn parseList(self: *Parser) !Token {
             .loc = .{
                 .start = self.index,
                 .end = self.index,
+                .line_no = self.line_no,
             },
         };
     }
@@ -693,6 +704,7 @@ pub fn parseListQuote(self: *Parser) Token {
                 token.loc.end = self.index;
                 return token;
             },
+            else => {},
         }
     }
 
@@ -730,6 +742,7 @@ pub fn newToken(self: *Parser) Token {
         .tag = undefined,
         .loc = .{
             .start = self.index,
+            .line_no = self.line_no,
             .end = undefined,
         },
     };
@@ -739,23 +752,36 @@ pub fn errorIfAtEndAfterBackslash(self: *Parser) !void {
     if (self.atEnd()) {
         self.error_details = .{
             .index = self.index,
+            .line_no = self.line_no,
         };
         return Error.TrailingBackslash;
     }
 }
 
 const Mark = struct {
-    index: usize,
+    index: u32,
+    line_no: u32,
+    in_quote: bool,
+    comment_possible: bool,
+    last_token_type: Token.Tag,
 };
 
 pub fn mark(self: *Parser) Mark {
     return .{
         .index = self.index,
+        .line_no = self.line_no,
+        .in_quote = self.in_quote,
+        .comment_possible = self.comment_possible,
+        .last_token_type = self.last_token_type,
     };
 }
 
 pub fn restore(self: *Parser, mark_loc: Mark) void {
     self.index = mark_loc.index;
+    self.line_no = mark_loc.line_no;
+    self.in_quote = mark_loc.in_quote;
+    self.comment_possible = mark_loc.comment_possible;
+    self.last_token_type = mark_loc.last_token_type;
 }
 
 pub fn current(self: *Parser) u8 {
@@ -771,7 +797,13 @@ pub fn peek(self: *Parser, ahead_by: usize) ?u8 {
 }
 
 pub fn advance(self: *Parser, count: usize) void {
-    self.index += count;
+    for (0..count) |_| {
+        if (self.buffer[self.index] == '\n') {
+            self.line_no += 1;
+        }
+
+        self.index += 1;
+    }
 }
 
 /// Checks if the next characters match `str`. Returns false if there are not enough
@@ -807,7 +839,7 @@ test "Parser" {
     try testNextToken(&parser, .word_separator, " ");
     try testNextToken(&parser, .simple_string, "y");
     try testNextToken(&parser, .word_separator, " ");
-    try testNextToken(&parser, .simple_string, "a b c");
+    try testNextToken(&parser, .braced_string, "a b c");
 
     try testNextToken(&parser, .end_of_file, "");
 }

@@ -28,10 +28,11 @@ pub const HeapSettings = struct {
     string_heap_order: u6 = 28,
     /// Maximum number of custom types.
     max_custom_types: usize = 65536,
-    /// Maximum number of custom type instances.
-    max_custom_type_instances: u32 = 65536,
     /// Maximum number of heaps (not necessarily initialized).
     max_heaps: usize = 128,
+    /// Whether to enable memory tracing (for debugging only, as
+    /// it leaks the strings it allocates)
+    trace_mem: bool = false,
 };
 const cfg: HeapSettings = .{};
 
@@ -51,6 +52,7 @@ objects: ObjectList,
 string_tracking: StringTracker,
 strings: StringList,
 
+dicts: DictionaryPool,
 type_instances: CustomTypeInstancePool,
 parsed_scripts: ParsedScripts,
 
@@ -59,23 +61,41 @@ const Mutex = if (cfg.threading) std.Thread.Mutex else DummyMutex;
 
 const ObjectTracker = memutil.BuddyUnmanaged(cfg.object_heap_order);
 const ObjectList = std.MultiArrayList(ObjectAndMetadata);
-
 const StringTracker = memutil.BuddyUnmanaged(cfg.string_heap_order);
 const StringList = std.ArrayList(u8);
 
-const CustomTypeInstance = struct {
+const DictionaryPool = memutil.IndexedMemoryPool(Dictionary, cfg.use_vmem);
+const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
+const ParsedScripts = std.AutoHashMapUnmanaged(ScriptId, ParsedScript);
+
+pub const DictIndex = u32;
+pub const Dictionary = struct {
+    /// This does not store the key/value pairs directly, instead it
+    /// is an mapping of key to value index.
+    dict: std.HashMapUnmanaged(Handle, u32, struct {
+        pub fn hash(ctx: @This(), key: Handle) u64 {
+            _ = ctx;
+
+            const str = key.getString() catch return 0;
+            return std.hash_map.hashString(str);
+        }
+
+        pub fn eql(ctx: @This(), a: Handle, b: Handle) bool {
+            _ = ctx;
+
+            return checkIfEqual(a, b) catch return false;
+        }
+    }, 80),
+    /// Length of dictionaries' backing list, including potential duplicated
+    /// keys when shimmering from list.
+    len: u32,
+};
+
+pub const CustomTypeInstance = struct {
     first_ptr: *anyopaque,
     second_ptr: *anyopaque,
 };
-const CustomTypeInstancePool = memutil.IndexedMemoryPool(CustomTypeInstance, cfg.use_vmem);
 
-pub const TokenAndValue = struct {
-    token: Parser.Token.Tag,
-    value: union {
-        int: i32,
-        str: [:0]u8,
-    },
-};
 /// Local to the interpreter. Not threadsafe.
 const ParsedScript = struct {
     /// A handle pointing to a tcl list that has the same length as `tokens`,
@@ -83,7 +103,7 @@ const ParsedScript = struct {
     /// the same as the stack.
     objects: Handle,
     /// Tokens array.
-    tokens: []TokenAndValue,
+    tokens: []Parser.Token.Tag,
     /// File name.
     filename: [:0]u8,
     /// Line number of the first line.
@@ -91,9 +111,16 @@ const ParsedScript = struct {
     /// Ref count (starts at 1 when created).
     ref_count: u32,
 };
-const ParsedScripts = std.AutoHashMapUnmanaged(ScriptId, ParsedScript);
 
-const Object = packed struct(u128) {
+pub const Object = packed struct(u128) {
+    pub const null_string: StrOrPtr = .{
+        .u = .{ .str = .{ .index = 0, .len = 0 } },
+        .is_ptr = false,
+    };
+    pub const empty_string: StrOrPtr = .{
+        .u = .{ .str = .{ .index = 1, .len = 0 } },
+        .is_ptr = false,
+    };
     pub const StrOrPtr = packed struct(u59) {
         u: packed union {
             str: packed struct {
@@ -132,6 +159,7 @@ pub const Tag = enum(u5) {
     bool,
     string,
     list,
+    dict,
     source,
     script,
     reference,
@@ -146,12 +174,12 @@ pub const ListIndex = packed struct {
         end_offset: i33,
     },
     /// Whether this is the index "end", or "end-1", etc
-    is_end: bool,
+    is_relative: bool,
 
-    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_end = true };
+    pub const end: ListIndex = .{ .u = .{ .end_offset = 0 }, .is_relative = true };
 
     pub fn asAbsoluteIndex(self: ListIndex, list_len: u32) !usize {
-        if (self.is_end) {
+        if (self.is_relative) {
             const idx = std.math.add(i33, self.u.end_offset, list_len -| 1) catch return error.BadIndex;
             if (idx < 0) return error.BadIndex;
             if (idx > list_len) return error.BadIndex;
@@ -214,7 +242,6 @@ pub const Body = packed union {
         line_no: u32,
     },
     list: packed struct {
-        start: u32,
         len: u32,
     },
     script: packed struct {
@@ -225,6 +252,11 @@ pub const Body = packed union {
         type_id: u32,
         index: u32,
     },
+    /// Items of the dictionary are stored directly after, similar to a list.
+    /// Keys and values alternate. Allows for duplicate keys when shimmering
+    /// from a list, but duplicates will be removed when any writing operation
+    /// happens.
+    dict: DictIndex,
 };
 
 comptime {
@@ -255,6 +287,54 @@ pub const Handle = packed struct(u64) {
         const str = getString(self) catch "<oom string>";
         try writer.writeAll(str);
     }
+
+    pub fn peek(handle: Handle) *Object {
+        return getHeap(handle).getLocalObject(handle.index);
+    }
+
+    pub fn getHeap(handle: Handle) *Heap {
+        return &heaps[handle.heap];
+    }
+
+    pub fn canShimmer(handle: Handle) bool {
+        // Can't shimmer if it's shared between threads
+        return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
+    }
+
+    pub fn reference(handle: Handle) Object {
+        assert(handle.ref_counted);
+        incrRefCountOf(u32, &handle.getHeap().objects.items(.ref_count)[handle.index]);
+
+        return .{
+            // References are guaranteed to always have a null representation.
+            .str = Object.null_string,
+            .tag = .reference,
+            .body = .{
+                .reference = handle,
+            },
+        };
+    }
+
+    /// Guaranteed to be valid, barring OOM.
+    pub fn getString(handle: Handle) ![:0]const u8 {
+        return try handle.getHeap().getLocalString(handle.index);
+    }
+
+    /// Copies provided string.
+    pub fn setString(handle: Handle, bytes: []const u8) !void {
+        const heap = handle.getHeap();
+
+        // Try setting as a normal string first
+        const did_set = try heap.setNormalString(handle.index, bytes);
+        if (!did_set) {
+            // Setting it as a long string will most likely take ownership,
+            // so we need to copy.
+            const new_str = try heap.gpa.dupeZ(u8, bytes);
+            errdefer heap.gpa.free(new_str);
+            const took_ownership = try heap.setLongString(handle.index, new_str, .normal);
+            if (!took_ownership) heap.gpa.free(new_str);
+        }
+    }
 };
 
 const ObjectAndMetadata = struct {
@@ -272,6 +352,7 @@ const ObjectAndMetadata = struct {
         /// Whether this object is currently being used (used to track double frees)
         in_use: bool,
     },
+    trace: std.debug.ConfigurableTrace(8, 8, @import("builtin").mode == .Debug),
 };
 
 fn heapAlloc(self: *Heap) Allocator {
@@ -307,7 +388,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     }
 
     // Init strings
-    var string_tracking = try StringTracker.init(gpa, 32);
+    var string_tracking = try StringTracker.init(gpa, cfg.string_heap_order);
     errdefer string_tracking.deinit(gpa);
 
     var strings: StringList = .{};
@@ -322,10 +403,14 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
     }
     errdefer if (cfg.use_vmem) memutil.vmemUnmap(@alignCast(strings.items)) else strings.deinit(gpa);
 
+    const object_capacity = if (cfg.threading) object_heap_max_count else 32;
+
     // Init type instances
-    const type_instances_capacity = if (cfg.threading) cfg.max_custom_type_instances else 32;
-    var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, type_instances_capacity);
+    var type_instances: CustomTypeInstancePool = try .initWithCapacity(gpa, object_capacity);
     errdefer type_instances.deinit(gpa);
+
+    var dictionaries: DictionaryPool = try .initWithCapacity(gpa, object_capacity);
+    defer dictionaries.deinit(gpa);
 
     var parsed_scripts: ParsedScripts = .{};
     errdefer parsed_scripts.deinit(gpa);
@@ -340,6 +425,7 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
         .string_tracking = string_tracking,
         .strings = strings,
 
+        .dicts = dictionaries,
         .type_instances = type_instances,
         .parsed_scripts = parsed_scripts,
     };
@@ -362,7 +448,13 @@ pub fn init(gpa: Allocator, heap_id: HeapId) !Heap {
 pub fn deinit(self: *Heap) void {
     for (0..self.objects.len) |i| {
         if (self.objects.get(i).metadata.in_use) {
-            self.freeObject(.{ .index = @intCast(i), .heap = self.heap_id, .ref_counted = undefined });
+            // We don't use free object here, as it may cause a double-free when
+            // freeing recursive structures. For example, if there was a list with
+            // two items, we'll free the list (first free of items), then free
+            // the items individually (second free)
+            const handle = self.getHandle(@intCast(i), false);
+            self.invalidateBody(handle);
+            self.invalidateString(handle);
         }
     }
 
@@ -378,17 +470,14 @@ pub fn deinit(self: *Heap) void {
     self.object_tracking.deinit(self.gpa);
     self.string_tracking.deinit(self.gpa);
 
+    self.dicts.deinit(self.gpa);
     self.type_instances.deinit(self.gpa);
     self.parsed_scripts.deinit(self.gpa);
 }
 
 pub fn createObject(self: *Heap) !Handle {
     const index = try self.createObjects(1);
-    return .{
-        .index = index,
-        .heap = self.heap_id,
-        .ref_counted = true,
-    };
+    return self.normalHandle(index);
 }
 
 /// create_objects does not initialize objects, but does initialize
@@ -403,35 +492,38 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 
     const end = index + count;
 
-    // Make sure arrays have space for new objects
+    // Make object list has space for new objects
     if (self.objects.len < index + count) {
         const start_of_new = self.objects.len;
         try self.objects.resize(self.heapAlloc(), index + count);
-        @memset(self.objects.items(.object)[start_of_new..self.objects.len], .{
-            .str = .{
-                .u = .{ .str = .{ .index = 0, .len = 0 } },
-                .is_ptr = false,
-            },
-            .tag = .none,
-            .body = .{
-                .number = 0,
-            },
+        @memset(self.objects.items(.metadata)[start_of_new..self.objects.len], .{
+            .order = 31,
+            .is_alloc_head = false,
+            .cross_thread = false,
+            .in_use = false,
         });
+    }
+
+    if (cfg.trace_mem) {
+        self.objects.items(.trace)[index].addAddr(
+            @returnAddress(),
+            try std.fmt.allocPrint(
+                self.gpa,
+                "Alloc {} of order {}",
+                .{ index, order },
+            ),
+        );
     }
 
     // Make sure the items we're allocating are free (used to
     // ensure our allocator hasn't reached a broken state).
-    // Might not be necessary.
     for (self.objects.items(.metadata)[index..end]) |metadata| {
         assert(metadata.in_use == false);
     }
 
     // Initialize all as empty objects
     @memset(self.objects.items(.object)[index..end], .{
-        .str = .{
-            .u = .{ .str = .{ .index = 0, .len = 0 } },
-            .is_ptr = false,
-        },
+        .str = Object.null_string,
         .tag = .none,
         .body = .{
             .number = 0,
@@ -463,33 +555,40 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
 }
 
 fn freeObject(calling_heap: *Heap, handle: Handle) void {
-    const obj_heap = getHeap(handle);
+    const obj_heap = handle.getHeap();
 
     calling_heap.invalidateBody(handle);
     calling_heap.invalidateString(handle);
 
-    const metadata = obj_heap.objects.get(handle.index).metadata;
+    const metadata = obj_heap.objects.items(.metadata)[handle.index];
     if (metadata.is_alloc_head) {
         obj_heap.mem_mgmt_mutex.lock();
+        if (cfg.trace_mem) {
+            const trace = &calling_heap.objects.items(.trace)[handle.index];
+            trace.addAddr(@returnAddress(), std.fmt.allocPrint(
+                calling_heap.gpa,
+                "Free {} of order {}",
+                .{ handle.index, metadata.order },
+            ) catch "OOM");
+
+            if (!metadata.in_use) {
+                trace.dump();
+                @panic("Double free!");
+            }
+        } else if (!metadata.in_use) {
+            @panic("Double free!");
+        }
+
         obj_heap.object_tracking.free(handle.index, metadata.order);
         obj_heap.objects.items(.metadata)[handle.index].in_use = false;
         obj_heap.mem_mgmt_mutex.unlock();
     }
 }
 
-pub fn getHeap(handle: Handle) *Heap {
-    return &heaps[handle.heap];
-}
-
-pub fn canShimmer(handle: Handle) bool {
-    // Can't shimmer if it's shared between threads
-    return !getHeap(handle).objects.get(handle.index).metadata.cross_thread;
-}
-
 /// If the object can't be shimmered, this will duplicate said object
 /// and release the original object.
 pub fn ensureShimmerable(calling_heap: *Heap, handle: *Handle) !void {
-    if (!Heap.canShimmer(handle.*)) {
+    if (!handle.canShimmer()) {
         const before_duplicating = handle.*;
         handle.* = try calling_heap.duplicate(handle.*);
         calling_heap.release(before_duplicating);
@@ -497,23 +596,63 @@ pub fn ensureShimmerable(calling_heap: *Heap, handle: *Handle) !void {
 }
 
 pub fn invalidateString(calling_heap: *Heap, handle: Handle) void {
+    assert(handle.canShimmer());
+
     _ = calling_heap;
-    getHeap(handle).invalidateLocalString(handle.index);
+
+    const obj = handle.peek();
+    const obj_heap = handle.getHeap();
+
+    switch (obj_heap.getLocalStringDetails(handle.index)) {
+        .long => |long_str| {
+            long_str.decrRefCount(obj_heap.gpa);
+        },
+        .normal => {
+            obj_heap.freeString(obj.str.u.str.index, obj.str.u.str.len);
+        },
+        .null, .empty => {},
+    }
+
+    // Be sure to mark as having no string
+    obj.str.is_ptr = false;
+    obj.str.u.str = .{
+        .index = 0,
+        .len = 0,
+    };
 }
 
 /// `calling_heap` _must_ be the heap that this is being called from,
 /// _not_ the handle's heap. Used to guarantee safe freeing of
 /// non-threadsafe objects.
 pub fn invalidateBody(calling_heap: *Heap, handle: Handle) void {
-    const obj_heap = getHeap(handle);
+    assert(handle.canShimmer());
+
+    const obj_heap = handle.getHeap();
     const obj: *Object = &obj_heap.objects.items(.object)[handle.index];
 
     switch (obj.tag) {
         .list => {
             const list = obj.body.list;
 
-            for (0..list.len) |i| {
-                obj_heap.freeObject(.{ .index = @intCast(i), .heap = handle.heap, .ref_counted = undefined });
+            // Don't free the head (e.g. self)
+            for (1..(list.len + 1)) |i| {
+                obj_heap.freeObject(.{
+                    .index = @intCast(handle.index + i),
+                    .heap = handle.heap,
+                    .ref_counted = false,
+                });
+            }
+        },
+        .dict => {
+            const dict = &obj_heap.dicts.items[obj.body.dict];
+
+            // Don't free the head (e.g. self)
+            for (1..(dict.len + 1)) |i| {
+                obj_heap.freeObject(.{
+                    .index = @intCast(handle.index + i),
+                    .heap = handle.heap,
+                    .ref_counted = false,
+                });
             }
         },
         .custom_type => {
@@ -535,9 +674,9 @@ pub fn invalidateBody(calling_heap: *Heap, handle: Handle) void {
             obj.body.script.id = .null;
 
             // If we're not in the same heap, we can't safely free the script.
-            if (calling_heap != obj_heap) return;
-
-            _ = obj_heap.parsed_scripts.remove(script.id);
+            if (calling_heap == obj_heap) {
+                _ = obj_heap.parsed_scripts.remove(script.id);
+            }
         },
         .source => {
             const source = obj.body.source;
@@ -546,27 +685,8 @@ pub fn invalidateBody(calling_heap: *Heap, handle: Handle) void {
         },
         .none, .index, .number, .float, .bool => {},
     }
-}
 
-fn invalidateLocalString(self: *Heap, index: u32) void {
-    const obj: *Object = &self.objects.items(.object)[index];
-
-    switch (self.getLocalStringDetails(index)) {
-        .long => |long_str| {
-            long_str.decrRefCount(self.gpa);
-        },
-        .normal => {
-            self.freeString(obj.str.u.str.index, obj.str.u.str.len);
-        },
-        .null, .empty => {},
-    }
-
-    // Be sure to mark as having no string
-    obj.str.is_ptr = false;
-    obj.str.u.str = .{
-        .index = 0,
-        .len = 0,
-    };
+    obj.tag = .none;
 }
 
 /// Get a string slice from heap string storage
@@ -597,7 +717,40 @@ pub fn freeString(self: *Heap, index: u32, len: u32) void {
     self.mem_mgmt_mutex.unlock();
 }
 
-/// Increase ref count if possible, otherwise duplicate.
+pub fn checkIfEqual(a: Handle, b: Handle) !bool {
+    if (a == b) return true;
+
+    // Make sure they have a string rep before checking the details
+    const a_str = try a.getString();
+    const b_str = try b.getString();
+    const a_details = getStringDetails(a);
+    const b_details = getStringDetails(b);
+
+    switch (a_details) {
+        .long => |a_long_str| {
+            switch (b_details) {
+                .long => |b_long_str| {
+                    // If both strings are long strings, we can just
+                    // compare their hashes instead of the whole string
+                    return a_long_str.getHash() == b_long_str.getHash();
+                },
+                else => {
+                    return std.mem.eql(u8, a_str, b_str);
+                },
+            }
+        },
+        // We generated string reps when calling getString, so
+        // we know it's not null
+        .null => unreachable,
+        else => {
+            return std.mem.eql(u8, a_str, b_str);
+        },
+    }
+
+    return std.mem.eql(u8, a_str, b_str);
+}
+
+/// Increase ref count if possible, otherwise duplicate onto calling_heap.
 pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
     // If the object isn't ref counted, then we'll need to clone it (i.e. a list item)
     if (!handle.ref_counted) {
@@ -605,7 +758,7 @@ pub fn borrow(calling_heap: *Heap, handle: Handle) !Handle {
     }
 
     // This object may have come from another heap
-    const obj_heap = getHeap(handle);
+    const obj_heap = handle.getHeap();
 
     incrRefCountOf(u32, &obj_heap.objects.items(.ref_count)[handle.index]);
 
@@ -616,7 +769,7 @@ pub fn release(calling_heap: *Heap, handle: Handle) void {
     if (!handle.ref_counted) return;
 
     // This object may have come from another heap
-    var heap = getHeap(handle);
+    var heap = handle.getHeap();
 
     if (decrRefCountOf(u32, &heap.objects.items(.ref_count)[handle.index])) {
         calling_heap.freeObject(handle);
@@ -643,13 +796,14 @@ fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
             };
         },
         .null, .empty => {
-            return peek(handle).str;
+            return handle.peek().str;
         },
     }
 }
 
-fn duplicateSingle(self: *Heap, handle: Handle) !Object {
-    const src = peek(handle);
+/// If called with a multi-item object, will return error.MultiItemObject
+pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
+    const src = handle.peek();
     switch (src.tag) {
         .none, .index, .number, .float, .string, .bool, .script => {
             return .{
@@ -681,16 +835,7 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
             };
         },
         .reference => {
-            const ref = src.body.reference;
-            const new_handle = try self.borrow(ref);
-            return .{
-                .str = .{
-                    .u = .{ .str = .{ .index = 0, .len = 0 } },
-                    .is_ptr = false,
-                },
-                .tag = .reference,
-                .body = .{ .reference = new_handle },
-            };
+            return src.body.reference.reference();
         },
         .custom_type => {
             const custom_type = src.body.custom_type;
@@ -710,61 +855,118 @@ fn duplicateSingle(self: *Heap, handle: Handle) !Object {
 
             return new_object;
         },
-        .list => {
-            @panic("duplicateSingle called with multi item object");
+        .list, .dict => {
+            return error.MultiItemObject;
         },
     }
 }
 
-pub fn duplicate(self: *Heap, handle: Handle) error{OutOfMemory}!Handle {
-    const src = peek(handle);
+pub fn duplicate(calling_heap: *Heap, handle: Handle) error{OutOfMemory}!Handle {
+    const src = handle.peek();
 
     switch (src.tag) {
         .list => {
-            const old_head = src;
-            const old_body = old_head.body.list;
+            const old_body = src.body.list;
+            const old_start = handle.index + 1;
 
-            const new_list_idx = try self.createObjects(1 + old_body.len);
+            const new_list_idx = try calling_heap.createObjects(1 + old_body.len);
             errdefer {
-                // Iterate in reverse order to prevent freeing the head of the list first
-                var i = new_list_idx + 1 + old_body.len;
-                while (i > 0) {
-                    i -= 1;
-                    self.release(self.normalHandle(i));
+                // Free elements before freeing the head, as the head could
+                // be swapped out if freed too early
+                for (0..old_body.len) |i| {
+                    calling_heap.freeObject(.{
+                        .index = @intCast(new_list_idx + 1 + i),
+                        .heap = handle.heap,
+                        .ref_counted = false,
+                    });
                 }
+                calling_heap.freeObject(.{ .index = new_list_idx, .heap = handle.heap, .ref_counted = true });
             }
-            const new_head: *Object = &self.objects.items(.object)[new_list_idx];
+            const new_head: *Object = &calling_heap.objects.items(.object)[new_list_idx];
             const new_start = new_list_idx + 1;
-            const new_end = new_start + old_body.len;
-            var new_items = self.objects.items(.object)[new_start..new_end];
+            const new_items = calling_heap.objects.items(.object)[new_start..][0..old_body.len];
 
             // Duplicate head of list
             new_head.* = .{
-                .str = try self.duplicateObjString(handle),
+                .str = try calling_heap.duplicateObjString(handle),
                 .tag = .list,
                 .body = .{
-                    .list = .{
-                        .start = new_list_idx + 1,
-                        .len = old_body.len,
-                    },
+                    .list = .{ .len = old_body.len },
                 },
             };
 
             // Duplicate items of list
-            var i: usize = 0;
-            while (i < old_body.len) : (i += 1) {
-                new_items[i] = try self.duplicateSingle(.{
+            for (new_items, 0..) |*new_item, i| {
+                new_item.* = calling_heap.duplicateSingle(.{
                     .heap = handle.heap,
-                    .index = @intCast(old_body.start + i),
+                    .index = @intCast(old_start + i),
                     .ref_counted = false,
-                });
+                }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Lists can't contain multi item objects
+                    error.MultiItemObject => unreachable,
+                };
             }
 
-            return self.normalHandle(new_list_idx);
+            return calling_heap.normalHandle(new_list_idx);
+        },
+        .dict => {
+            const old_head = &calling_heap.dicts.items[src.body.dict];
+            const old_start = handle.index + 1;
+
+            const new_dict_idx = try calling_heap.createObjects(1 + old_head.len);
+            errdefer {
+                // Free elements before freeing the head, as the head could
+                // be realloced before finishing if freed too early
+                for (0..old_head.len) |i| {
+                    calling_heap.freeObject(.{
+                        .index = @intCast(new_dict_idx + 1 + i),
+                        .heap = handle.heap,
+                        .ref_counted = false,
+                    });
+                }
+                calling_heap.freeObject(.{ .index = new_dict_idx, .heap = handle.heap, .ref_counted = true });
+            }
+            const new_head: *Object = &calling_heap.objects.items(.object)[new_dict_idx];
+            const new_start = new_dict_idx + 1;
+            const new_items = calling_heap.objects.items(.object)[new_start..][0..old_head.len];
+
+            // Duplicate head of dict
+            new_head.* = .{
+                .str = try calling_heap.duplicateObjString(handle),
+                .tag = .dict,
+                .body = .{
+                    .dict = try calling_heap.createDictionary(),
+                },
+            };
+            errdefer calling_heap.dicts.destroy(new_head.body.dict);
+
+            // Duplicate items of dict
+            for (new_items, 0..) |*new_item, i| {
+                new_item.* = calling_heap.duplicateSingle(.{
+                    .heap = handle.heap,
+                    .index = @intCast(old_start + i),
+                    .ref_counted = false,
+                }) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // Dicts can't contain multi item objects
+                    error.MultiItemObject => unreachable,
+                };
+            }
+
+            const dict = &calling_heap.dicts.items[new_head.body.dict];
+            dict.len = old_head.len;
+            try reindexDict(calling_heap.gpa, calling_heap.normalHandle(new_dict_idx));
+
+            return calling_heap.normalHandle(new_dict_idx);
         },
         else => {
-            const new_object = try self.createObject();
-            self.objects.items(.object)[new_object.index] = try self.duplicateSingle(handle);
+            const new_object = try calling_heap.createObject();
+            calling_heap.objects.items(.object)[new_object.index] = calling_heap.duplicateSingle(handle) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                // We already checked if it was a multi-item object (i.e. a list)
+                error.MultiItemObject => unreachable,
+            };
             return new_object;
         },
     }
@@ -778,23 +980,22 @@ pub fn normalHandle(self: *Heap, index: u32) Handle {
     };
 }
 
-pub fn peek(handle: Handle) *Object {
-    return getHeap(handle).getLocalObject(handle.index);
+pub fn getHandle(self: *Heap, index: u32, ref_counted: bool) Handle {
+    return .{
+        .heap = self.heap_id,
+        .index = index,
+        .ref_counted = ref_counted,
+    };
 }
 
 pub fn getLocalObject(self: *Heap, index: u32) *Object {
     return &self.objects.items(.object)[index];
 }
 
-/// Guaranteed to be valid, barring OOM.
-pub fn getString(handle: Handle) ![:0]const u8 {
-    return try getHeap(handle).getLocalString(handle.index);
-}
-
 /// Get the string to modify (must not write any longer than current len).
 /// Not threadsafe.
 pub fn getStringMut(handle: Handle) ![:0]u8 {
-    const heap = getHeap(handle);
+    const heap = handle.getHeap();
     try heap.getLocalString(handle.index); // generate rep
 
     const obj = heap.getLocalObject(handle.index);
@@ -810,56 +1011,10 @@ pub fn getStringMut(handle: Handle) ![:0]u8 {
     }
 }
 
-/// Copies provided string.
-pub fn setString(handle: Handle, bytes: []const u8) !void {
-    const heap = getHeap(handle);
-    // TODO optimize, we shouldn't copy the string twice (I
-    // probably need to redesign the `setLocalString` API)
-    const new_str = try heap.gpa.dupeZ(u8, bytes);
-    errdefer heap.gpa.free(new_str);
-    const took_ownership = try heap.setLocalString(handle.index, new_str);
-    if (!took_ownership) heap.gpa.free(new_str);
-}
-
-/// Returns whether it took ownership of the bytes. Threadsafe.
-fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
-    var took_ownership = false;
-
-    // Figure out the best way to represent the string
-    var new_str_or_ptr: Object.StrOrPtr = undefined;
-    if (bytes.len == 0) {
-        new_str_or_ptr.u.str = .{
-            .index = empty_string,
-            .len = 0,
-        };
-        new_str_or_ptr.is_ptr = false;
-    } else if (bytes.len < LongString.split_point) {
-        const local_string = try self.createString(@intCast(bytes.len));
-        const len: u26 = @intCast(bytes.len);
-        @memcpy(
-            self.getHeapString(local_string, local_string + len),
-            bytes,
-        );
-
-        new_str_or_ptr.u.str = .{
-            .index = local_string,
-            .len = len,
-        };
-        new_str_or_ptr.is_ptr = false;
-    } else {
-        took_ownership = true;
-
-        const new_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
-        new_string.* = .{
-            .string = bytes,
-            .ref_count = 1,
-            .utf8_length = null,
-        };
-
-        new_str_or_ptr.u.ptr = LongString.toInt(new_string);
-        new_str_or_ptr.is_ptr = true;
-    }
-
+/// Low-level function, to exchange one value of an object's string to another.
+/// Returns whether the exchange was successful (if not, caller is responsible
+/// for cleaning up).
+pub fn exchangeString(self: *Heap, index: u32, expected: Object.StrOrPtr, to_set_to: Object.StrOrPtr) bool {
     const obj: *Object = &self.objects.items(.object)[index];
     if (cfg.threading and self.objects.get(index).metadata.cross_thread) {
         // Atomically swap only the first half of the object
@@ -867,49 +1022,111 @@ fn setLocalString(self: *Heap, index: usize, bytes: [:0]u8) !bool {
         if (@bitSizeOf(Object.StrOrPtr) != 59) @compileError("StrOrPtr must be exactly 59 bits wide");
         if (@bitOffsetOf(Object.StrOrPtr, "is_ptr") != 58) @compileError("Object.StrOrPtr.is_ptr must be in bit position 58");
 
-        const str_all_mask: u64 = (1 << 59) - 1;
-        const str_data_mask: u64 = (1 << 58) - 1;
+        const str_mask: u64 = (1 << 59) - 1;
 
         const object_head: *u64 = @ptrCast(obj);
-        var old_obj = @atomicLoad(u64, object_head, .monotonic);
+        var current_head = @atomicLoad(u64, object_head, .acquire);
 
         while (true) {
-            // Is the string pointer not null?
-            if (old_obj & str_data_mask != 0) {
-                // Somebody else must've won this, so we'll use their string
-                if (new_str_or_ptr.is_ptr) {
-                    took_ownership = false;
-                    LongString.fromInt(new_str_or_ptr.u.ptr).freeUnchecked(self.gpa);
-                } else {
-                    const local_string = new_str_or_ptr.u.str;
-                    if (local_string.index > 1) {
-                        self.freeString(local_string.index, local_string.len);
-                    }
-                }
-
-                break;
+            // Is the string pointer what we expected?
+            if (current_head & str_mask != @as(u59, @bitCast(expected))) {
+                // If not, somebody else must've won this, so let the caller know
+                return false;
             }
 
-            // Preserve tag from old_obj
-            var new_obj = old_obj & ~str_all_mask;
-            const new_obj_str: u59 = @bitCast(new_str_or_ptr);
-            new_obj |= new_obj_str;
+            const to_set_to_bits: u59 = @bitCast(to_set_to);
+            // Preserve type tag from current_head
+            var new_head = current_head & ~str_mask;
+            new_head |= to_set_to_bits;
 
-            const res: ?u64 = @cmpxchgWeak(u64, object_head, old_obj, new_obj, .release, .acquire);
+            const res: ?u64 = @cmpxchgWeak(u64, object_head, current_head, new_head, .release, .acquire);
 
-            if (res) |winning_obj| {
-                old_obj = winning_obj;
+            if (res) |winning_head| {
+                current_head = winning_head;
                 continue;
             } else {
                 // Successfully swapped
-                break;
+                return true;
             }
         }
     } else {
-        obj.str = new_str_or_ptr;
+        obj.str = to_set_to;
+        return true;
     }
+}
 
-    return took_ownership;
+/// Returns whether the heap took ownership. It may copy the bytes into
+/// the heap, so it can succeed while also not taking ownership.
+pub fn setStringOwning(handle: Handle, bytes: [:0]u8, details: ?LongString.Details) !bool {
+    const heap = handle.getHeap();
+
+    if (details) |unwrapped| {
+        // Details provided, so we must wrap it in a long string
+        return try heap.setLongString(handle.index, bytes, unwrapped);
+    } else if (try heap.setNormalString(handle.index, bytes)) {
+        // Successfully set as normal string.
+        return false;
+    } else {
+        return try heap.setLongString(handle.index, bytes, .normal);
+    }
+}
+
+/// Low-level function. You probably want Heap.setString().
+/// Attempts to copy the provided string into the object heap.
+/// Returns false if the string is too big.
+pub fn setNormalString(self: *Heap, index: u32, bytes: []const u8) !bool {
+    if (bytes.len == 0) {
+        // No need to check the result of the exchange, as there's nothing to clean up
+        _ = self.exchangeString(index, Object.null_string, Object.empty_string);
+        return true;
+    } else if (bytes.len < LongString.split_point) {
+        const string = try self.createString(@intCast(bytes.len));
+        const len: u26 = @intCast(bytes.len);
+        @memcpy(
+            self.getHeapString(string, string + len),
+            bytes,
+        );
+
+        const string_header: Object.StrOrPtr = .{
+            .u = .{
+                .str = .{ .index = string, .len = len },
+            },
+            .is_ptr = false,
+        };
+
+        const did_win = self.exchangeString(index, Object.null_string, string_header);
+        if (!did_win) {
+            self.freeString(string, len);
+        }
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
+/// Low-level function. You probably want Heap.setString().
+/// Returns whether the object heap took ownership of the string.
+/// The only case where this would fail is OOM or if someone else
+/// exchanged the string right before us.
+pub fn setLongString(self: *Heap, index: u32, bytes: [:0]u8, details: LongString.Details) !bool {
+    assert(bytes.len > 0);
+
+    const long_string = &(try self.gpa.alignedAlloc(LongString, LongString.align_type, 1))[0];
+    errdefer self.gpa.free(long_string);
+    long_string.* = .{
+        .string = bytes,
+        .details = details,
+        .ref_count = 1,
+        .utf8_length = null,
+    };
+
+    const string_header = Object.StrOrPtr{
+        .u = .{ .ptr = LongString.toInt(long_string) },
+        .is_ptr = true,
+    };
+
+    return self.exchangeString(index, Object.null_string, string_header);
 }
 
 const empty_string_value = "";
@@ -950,14 +1167,20 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
         .list => {
             const list = obj.body.list;
-            new_str = try getListString(self, list.start, list.len);
+            new_str = try getListString(self, index + 1, list.len);
+        },
+        .dict => {
+            const dict = &self.dicts.items[obj.body.dict];
+            new_str = try getListString(self, index + 1, dict.len);
         },
         .custom_type => {
             const custom_type = obj.body.custom_type;
             new_str = try custom_types[custom_type.type_id].get_string(self, obj);
         },
         .reference => {
-            return getString(obj.body.reference);
+            // Intentionally return early, since we should always use
+            // the reference's string, not our own
+            return obj.body.reference.getString();
         },
         .source, .script => {
             @panic("Source and script objects should always have a string representation");
@@ -967,7 +1190,7 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
         },
     }
 
-    const took_ownership = try self.setLocalString(index, new_str);
+    const took_ownership = try setStringOwning(self.normalHandle(index), new_str, null);
     if (!took_ownership) self.gpa.free(new_str);
 
     // Rerun this function to figure out where the new string is
@@ -1035,7 +1258,7 @@ const StringDetails = union(enum) {
 };
 
 pub fn getStringDetails(handle: Handle) StringDetails {
-    return getHeap(handle).getLocalStringDetails(handle.index);
+    return handle.getHeap().getLocalStringDetails(handle.index);
 }
 
 fn getLocalStringDetails(self: *Heap, index: u32) StringDetails {
@@ -1070,7 +1293,20 @@ pub const LongString = struct {
 
     string: [:0]u8,
     utf8_length: ?u64,
+    details: Details,
+    hash: ?u256 = null,
     ref_count: usize,
+
+    /// Long strings are special in that they can have
+    /// extended properties (mmaping is in the plans,
+    /// for example). Since it has special properties,
+    /// we have to track them so it can be freed correctly.
+    pub const Details = union(enum) {
+        normal,
+        /// If the string was allocated with a different capacity
+        /// than its current reported length, set this field
+        different_capacity: u64,
+    };
 
     pub fn fromInt(int: u58) *align(align_amt) LongString {
         return @ptrFromInt(int << 6);
@@ -1078,6 +1314,19 @@ pub const LongString = struct {
 
     pub fn toInt(ptr: *align(align_amt) LongString) u58 {
         return @intCast(@intFromPtr(ptr) >> 6);
+    }
+
+    pub fn getHash(self: *align(align_amt) LongString) u256 {
+        if (self.hash) |hash| {
+            return hash;
+        } else {
+            var out: [32]u8 = [_]u8{0} ** 32;
+            std.crypto.hash.Blake3.hash(self.string, &out, .{});
+
+            const hash: u256 = @bitCast(out);
+            self.hash = hash;
+            return hash;
+        }
     }
 
     pub fn incrRefCount(self: *align(align_amt) LongString) void {
@@ -1091,6 +1340,13 @@ pub const LongString = struct {
     }
 
     pub fn freeUnchecked(self: *align(align_amt) LongString, gpa: Allocator) void {
+        switch (self.details) {
+            .normal => gpa.free(self.string),
+            .different_capacity => |capacity| {
+                gpa.free(self.string.ptr[0..capacity :0]);
+            },
+        }
+
         gpa.destroy(self);
     }
 };
@@ -1110,12 +1366,45 @@ pub const CustomTypes = struct {
     }
 };
 
+/// Panics if not a dict.
+pub fn reindexDict(gpa: Allocator, handle: Handle) !void {
+    const obj = handle.peek();
+    assert(obj.tag == .dict);
+    const dict = &handle.getHeap().dicts.items[obj.body.dict];
+    assert(dict.len % 2 == 0);
+
+    dict.dict.clearRetainingCapacity();
+
+    // This properly accounts for duplicate dictionary entries,
+    // as it'll just overwrite it the second `dict.put`
+    var pair: u32 = 0;
+    while (pair < dict.len) : (pair += 2) {
+        const key: Handle = .{
+            .index = handle.index + 1 + pair,
+            .heap = handle.heap,
+            .ref_counted = false,
+        };
+        // Point to `pair + 1`, e.g. the value following the key
+        try dict.dict.put(gpa, key, pair + 1);
+    }
+}
+
+pub fn createDictionary(self: *Heap) !DictIndex {
+    self.mem_mgmt_mutex.lock();
+    defer self.mem_mgmt_mutex.unlock();
+
+    const new_id = try self.dicts.create(self.gpa);
+    if (new_id >= object_heap_max_count) return error.OutOfMemory;
+
+    return @intCast(new_id);
+}
+
 pub fn createCustomTypeInstance(self: *Heap) !u32 {
     self.mem_mgmt_mutex.lock();
     defer self.mem_mgmt_mutex.unlock();
 
     const new_id = try self.type_instances.create(self.gpa);
-    if (new_id >= cfg.max_custom_type_instances) return error.OutOfMemory;
+    if (new_id >= object_heap_max_count) return error.OutOfMemory;
 
     return @intCast(new_id);
 }
@@ -1169,12 +1458,12 @@ test "Object duplication" {
     // Number object
     const obj = try heap.createObject();
     defer heap.release(obj);
-    var ref = peek(obj);
+    var ref = obj.peek();
     ref.tag = .number;
     ref.body.number = 10;
 
     const new_obj = try heap.duplicate(obj);
-    const new_ref = peek(new_obj);
+    const new_ref = new_obj.peek();
     defer heap.release(new_obj);
 
     try expectEqual(.number, new_ref.tag);
@@ -1196,11 +1485,11 @@ test "Get string" {
 
     const obj = try heap.createObject();
     defer heap.release(obj);
-    var ref = peek(obj);
+    var ref = obj.peek();
     ref.tag = .number;
     ref.body.number = 10;
 
-    try expectEqualSlices(u8, "10", try getString(obj));
+    try expectEqualSlices(u8, "10", try obj.getString());
 }
 
 const DummyMutex = struct {
@@ -1235,7 +1524,6 @@ pub fn incrRefCountOf(comptime T: type, ref: *T) void {
 }
 
 /// Returns true if count has reached zero. Multithreaded safe.
-/// Happens-after the previous decrement.
 pub fn decrRefCountOf(comptime T: type, ref: *T) bool {
     var after_sub: T = undefined;
     if (cfg.threading) {

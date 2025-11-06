@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const testing = std.testing;
 
 const options = @import("options");
 const stringutil = @import("./stringutil.zig");
@@ -13,14 +14,15 @@ pub const ErrorDetails = struct {
     index: ?u32 = null,
 };
 
-pub fn shimmerToString(calling_heap: *Heap, handle: Handle) !void {
-    assert(Heap.canShimmer(handle));
+pub fn shimmerToString(calling_heap: *Heap, handle: *Handle) !void {
+    if (handle.peek().tag == .string) return;
+    try Heap.ensureShimmerable(calling_heap, handle);
 
-    const obj = Heap.peek(handle);
-    _ = try Heap.getString(handle); // Ensure string representation
+    const obj = handle.peek();
+    _ = try handle.getString(); // Ensure string representation
 
     if (obj.tag != .string) {
-        Heap.invalidateBody(calling_heap, handle);
+        calling_heap.invalidateBody(handle.*);
         obj.tag = .string;
         obj.body.string = .{
             // Don't know the utf-8 length yet
@@ -30,14 +32,9 @@ pub fn shimmerToString(calling_heap: *Heap, handle: Handle) !void {
 }
 
 pub fn getCodepointLength(calling_heap: *Heap, handle: *Handle) !usize {
-    if (Heap.canShimmer(handle)) {
-        try shimmerToString(handle);
-    } else {
-        handle.* = try calling_heap.duplicate(handle);
-        try shimmerToString(handle);
-    }
+    shimmerToString(calling_heap, handle);
 
-    const obj = Heap.peek(handle);
+    const obj = handle.peek();
     const bytes = try Heap.getString(handle);
 
     if (obj.tag == .string) {
@@ -66,23 +63,45 @@ pub fn getCodepointLength(calling_heap: *Heap, handle: *Handle) !usize {
 
 /// Copies provided string.
 pub fn newString(calling_heap: *Heap, bytes: []const u8) !Handle {
-    const str = try calling_heap.createObject();
-    try Heap.setString(str, bytes);
-    try shimmerToString(calling_heap, str);
+    var str = try calling_heap.createObject();
+    try str.setString(bytes);
+    try shimmerToString(calling_heap, &str);
     return str;
 }
 
-pub fn newStringToFill(self: *Heap, len: usize) !Handle {
-    // TODO PERF this can be optimized with fewer allocations
-    const handle = try self.createObject();
+pub fn newStringFmt(calling_heap: *Heap, comptime fmt: []const u8, args: anytype) !Handle {
+    const str = try calling_heap.createObject();
+    // TODO PERF no need to allocate the string, just to duplicate it
+    const value = try std.fmt.allocPrint(calling_heap.gpa, fmt, args);
+    defer calling_heap.gpa.free(value);
+    try str.setString(value);
+    return str;
+}
 
-    // create new string
-    const new_str = self.gpa.alloc(u8, len + 1);
-    errdefer self.gpa.free(new_str);
-    @memset(new_str, 0);
+pub fn newStringToFill(heap: *Heap, len: usize) !Handle {
+    const handle = try heap.createObject();
 
-    const took_ownership = try self.setLocalString(handle.index, new_str);
-    if (!took_ownership) self.gpa.free(new_str);
+    if (len < Heap.LongString.split_point) {
+        const new_str = heap.createString(len);
+        @memset(heap.getHeapString(new_str, len), 0);
+
+        // New object, so we can set directly
+        handle.peek().str = .{
+            .u = .{
+                .str = .{ .index = new_str, .len = len },
+            },
+            .is_ptr = false,
+        };
+    } else {
+        // create new string
+        const new_str = heap.gpa.allocSentinel(u8, len, 0);
+        errdefer heap.gpa.free(new_str);
+        @memset(new_str, 0);
+        const did_take = try heap.setLongString(handle.index, new_str, .normal);
+        assert(did_take);
+    }
+
+    return handle;
 }
 
 /// Copies provided string.
@@ -91,7 +110,7 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
     Heap.setString(handle, bytes);
     shimmerToString(handle);
 
-    const obj = Heap.peek(handle);
+    const obj = handle.peek();
     switch (Heap.getStringDetails(handle)) {
         .long => |long_str| {
             long_str.utf8_length = cp_length;
@@ -108,15 +127,6 @@ pub fn newStringWithCodepointLen(heap: *Heap, bytes: [:0]const u8, cp_length: us
     }
 
     return handle;
-}
-
-pub fn checkIfEqual(a: Handle, b: Handle) !bool {
-    if (a == b) return true;
-
-    const a_str = try Heap.getString(a);
-    const b_str = try Heap.getString(b);
-
-    return std.mem.eql(u8, a_str, b_str);
 }
 
 pub fn globMatch(pattern: Handle, to_check: Handle, case_insensitive: bool) !bool {
@@ -141,10 +151,10 @@ pub const Range = struct {
     start: usize,
     end: usize,
 
-    pub fn fromObjects(det: *ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !?Range {
+    pub fn fromObjects(calling_heap: *Heap, det: ?*ErrorDetails, list_len: usize, start: *Handle, end: *Handle) !?Range {
         // Make sure we can distinguish between which input is the error.
-        const start_idx = try getIndex(start, det);
-        const end_idx = try getIndex(end, det);
+        const start_idx = try getIndex(calling_heap, start, det);
+        const end_idx = try getIndex(calling_heap, end, det);
 
         return constrainRange(list_len, .{
             .start = start_idx,
@@ -163,52 +173,20 @@ pub fn constrainRange(list_len: usize, range: Range) ?Range {
 }
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
-fn badIndex(calling_heap: *Heap, det: *ErrorDetails, handle: Handle) !void {
-    det.* = .{
-        .message = try newString(calling_heap, std.fmt.allocPrint(
-            calling_heap.gpa,
-            "bad index \"{O}\": must be intexpr or end?[+-]intexpr?",
-            .{handle},
-        )),
+fn badIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
+    if (det) |unwrapped| unwrapped.* = .{
+        .message = try newStringFmt(calling_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
     return error.BadIndex;
 }
 
-pub fn getIndex(det: *ErrorDetails, handle: *Handle) !Heap.ListIndex {
-    const obj = Heap.peek(*handle);
-
-    // Fast case: if it's an integer or float, we can quickly cast it (don't
-    // shimmer though, as it'll probably used for its original purpose still)
-    if (obj.tag == .number) {
-        if (obj.body.number < 0) return badIndex(det, handle);
-        if (obj.body.number > std.math.maxInt(u32)) return badIndex(det, handle);
-
-        return .{ .u = .{ .index = @intCast(obj.body.number) }, .is_end = false };
-    } else if (obj.tag == .float) {
-        const value = obj.body.float;
-
-        if (std.math.isNan(value)) return badIndex(det, handle);
-        if (value < 0) return badIndex(det, handle);
-        if (value > std.math.maxInt(u32)) return badIndex(det, handle);
-
-        return .{ .u = .{ .index = @intFromFloat(obj.body.number) }, .is_end = false };
-    }
-
-    if (obj.tag != .index) {
-        Heap.ensureShimmerable(handle);
-        return Heap.peek(handle.*).body.index;
-    } else {
-        return obj.body.index;
-    }
-}
-
 /// Shimmers to an index representation.
-pub fn shimmerToIndex(det: *ErrorDetails, handle: Handle) !void {
+pub fn shimmerToIndex(det: ?*ErrorDetails, handle: Handle) !void {
     assert(Heap.canShimmer(handle));
 
     const bytes = try Heap.getString(handle);
-    const obj = Heap.peek(handle);
+    const obj = handle.peek();
 
     // Does it start with "end"? If so, it might be end+5, or end-2, etc
     if (bytes.len >= 3 and std.mem.eql(u8, bytes[0..3], "end")) {
@@ -232,8 +210,43 @@ pub fn shimmerToIndex(det: *ErrorDetails, handle: Handle) !void {
     obj.tag = .index;
 }
 
+pub fn ensureIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    if (handle.peek().tag != .index) {
+        Heap.ensureShimmerable(calling_heap, handle);
+        shimmerToIndex(det, handle.*);
+    }
+}
+
+pub fn getIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !Heap.ListIndex {
+    const obj = handle.peek();
+
+    // Fast case: if it's an integer or float, we can quickly cast it (don't
+    // shimmer though, as it'll probably used for its original purpose still)
+    if (obj.tag == .number) {
+        if (obj.body.number < 0) return badIndex(det, handle);
+        if (obj.body.number > std.math.maxInt(u32)) return badIndex(det, handle);
+
+        return .{ .u = .{ .index = @intCast(obj.body.number) }, .is_end = false };
+    } else if (obj.tag == .float) {
+        const value = obj.body.float;
+
+        if (std.math.isNan(value)) return badIndex(det, handle);
+        if (value < 0) return badIndex(det, handle);
+        if (value > std.math.maxInt(u32)) return badIndex(det, handle);
+
+        return .{ .u = .{ .index = @intFromFloat(obj.body.number) }, .is_end = false };
+    }
+
+    if (obj.tag != .index) {
+        Heap.ensureShimmerable(calling_heap, handle);
+        return handle.peek().body.index;
+    } else {
+        return obj.body.index;
+    }
+}
+
 /// Creates a substring of the passed in string. Used in `[string range]`.
-pub fn stringRange(calling_heap: *Heap, det: *ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
+pub fn stringRange(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, start: *Handle, end: *Handle) !Handle {
     const codepoint_len = try getCodepointLength(str);
     const bytes = Heap.getString(str);
 
@@ -438,6 +451,10 @@ pub fn stringTrim(calling_heap: *Heap, str: Handle, trim_chars: Handle) !Handle 
     }
 }
 
+//////////////////////////////
+//  Enum related functions  //
+
+/// Byte count of enum names joined by ", "
 fn enumNamesCount(comptime T: type) usize {
     comptime {
         var result_size = 0;
@@ -507,19 +524,19 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
         pub const map = (EnumMapping(T){}).map;
         pub const names = enumNames(T);
 
-        pub fn get(calling_heap: *Heap, det: *ErrorDetails, value: *Handle) !T {
-            const bytes = try Heap.getString(value.*);
+        pub fn get(calling_heap: *Heap, det: ?*ErrorDetails, value: *Handle) !T {
+            const bytes = try value.getString();
             const variant = map.get(bytes);
             if (variant) |unwrapped| {
                 return unwrapped;
             } else {
-                const message = try std.fmt.allocPrint(
-                    calling_heap.gpa,
-                    "bad {s} \"{f}\": must be {s}",
-                    .{ enum_name, value.*, names },
-                );
-                defer calling_heap.gpa.free(message);
-                det.* = .{ .message = try newString(calling_heap, message) };
+                if (det) |unwrapped| unwrapped.* = .{
+                    .message = try newStringFmt(
+                        calling_heap,
+                        "bad {s} \"{f}\": must be {s}",
+                        .{ enum_name, value.*, names },
+                    ),
+                };
 
                 return error.BadEnumVariant;
             }
@@ -531,12 +548,12 @@ test "Tcl enum" {
     const Things = enum { foo, bar, baz };
     const map = (EnumMapping(Things){}).map;
     const names = enumNames(Things);
-    try std.testing.expectEqual(Things.foo, map.get("foo"));
-    try std.testing.expectEqualSlices(u8, "foo, bar, baz", names);
+    try testing.expectEqual(Things.foo, map.get("foo"));
+    try testing.expectEqualSlices(u8, "foo, bar, baz", names);
 }
 
 /// Runs a string check based on requested class.
-pub fn stringIs(calling_heap: *Heap, det: *ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
+pub fn stringIs(calling_heap: *Heap, det: ?*ErrorDetails, str: *Handle, class_to_check: *Handle, strict: bool) !bool {
     const Class = TclEnum(enum {
         integer,
         alpha,
@@ -557,7 +574,7 @@ pub fn stringIs(calling_heap: *Heap, det: *ErrorDetails, str: *Handle, class_to_
 
     const class = try Class.get(calling_heap, det, class_to_check);
 
-    const bytes = try Heap.getString(str.*);
+    const bytes = try str.getString();
     if (bytes.len == 0) {
         return !strict;
     }
@@ -572,7 +589,7 @@ pub fn stringIs(calling_heap: *Heap, det: *ErrorDetails, str: *Handle, class_to_
             return true;
         },
         .boolean => {
-            _ = getBoolean(calling_heap, str) catch return false;
+            _ = getBoolean(calling_heap, null, str) catch return false;
             return true;
         },
         .alpha => return stringutil.checkAllAscii(bytes, std.ascii.isAlphabetic),
@@ -591,7 +608,7 @@ pub fn stringIs(calling_heap: *Heap, det: *ErrorDetails, str: *Handle, class_to_
 }
 
 test "String is" {
-    const ta = std.testing.allocator;
+    const ta = testing.allocator;
     const heap = try Heap.createHeap(ta);
     defer Heap.deinitAll();
 
@@ -601,29 +618,245 @@ test "String is" {
     var bad_class = try newString(heap, "bad_class");
     var details: ErrorDetails = undefined;
 
-    try std.testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
-    try std.testing.expectEqual(false, try stringIs(heap, &details, &str2, &class, false));
-    try std.testing.expectError(error.BadEnumVariant, stringIs(heap, &details, &str, &bad_class, false));
-    try std.testing.expectEqualSlices(
-        u8,
+    try testing.expectEqual(true, try stringIs(heap, &details, &str, &class, false));
+    try testing.expectEqual(false, try stringIs(heap, &details, &str2, &class, false));
+    try testing.expectError(error.BadEnumVariant, stringIs(heap, &details, &str, &bad_class, false));
+    try testing.expectEqualStrings(
         "bad class \"bad_class\": must be integer, alpha, alnum, ascii, digit, " ++
             "double, lower, upper, space, xdigit, control, print, graph, punct, boolean",
-        try Heap.getString(details.message),
+        try details.message.getString(),
     );
+}
+
+pub fn convertParserError(heap: *Heap, err: Parser.Error) error{OutOfMemory}!ErrorDetails {
+    switch (err) {
+        error.CharactersAfterCloseBrace => {
+            return .{ .message = try newString(heap, "extra characters after close-brace") };
+        },
+        error.MissingCloseBrace => {
+            return .{ .message = try newString(heap, "missing close-brace") };
+        },
+        error.MissingCloseBracket => {
+            return .{ .message = try newString(heap, "unmatched \"[\"") };
+        },
+        error.MissingCloseQuote => {
+            return .{ .message = try newString(heap, "missing quote") };
+        },
+        error.TrailingBackslash => {
+            return .{ .message = try newString(heap, "no character after \\") };
+        },
+        error.NotVariable => unreachable,
+    }
+}
+
+pub fn newUninitializedList(heap: *Heap, len: u32) !Handle {
+    // `1 +` to make space for the list's head
+    const list_index = try heap.createObjects(1 + len);
+    const list: []Heap.Object = heap.objects.items(.object)[list_index..][0..(len + 1)];
+
+    list[0] = .{
+        .str = Heap.Object.null_string,
+        .tag = .list,
+        .body = .{
+            .list = .{
+                .len = len,
+            },
+        },
+    };
+
+    return heap.normalHandle(list_index);
+}
+
+pub fn newList(heap: *Heap, elements: []const Handle) !Handle {
+    const list = try newUninitializedList(heap, @intCast(elements.len));
+    errdefer heap.release(list);
+
+    const items = heap.objects.items(.object)[(list.index + 1)..][0..elements.len];
+
+    for (elements, items) |element, *item| {
+        item.* = Heap.duplicateSingle(heap, element) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            error.MultiItemObject => {
+                // This item can't be duplicated, as it contains multiple objects.
+                // We'll create a reference to it instead.
+                item.* = element.reference();
+                continue;
+            },
+        };
+    }
+
+    return list;
+}
+
+/// If shimmering, it creates the object in the calling heap
+pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    if (handle.peek().tag == .list) return;
+
+    const obj = handle.peek();
+    const obj_heap = handle.getHeap();
+
+    // Optimise dict -> list for object with no string rep.
+    if (obj.tag == .dict and Heap.getStringDetails(handle.*) == .null) {
+        try Heap.ensureShimmerable(calling_heap, handle);
+
+        const dict = &obj_heap.dicts.items[obj.body.dict];
+        const len = dict.len;
+
+        // Discard the old hash map.
+        dict.dict.clearAndFree(obj_heap.gpa);
+
+        // Because both lists and dicts store their values directly after,
+        // we can just swap out the head to convert to a list.
+        obj.* = .{
+            .str = Heap.Object.null_string,
+            .tag = .list,
+            .body = .{
+                .list = .{ .len = len },
+            },
+        };
+    } else {
+        // No need to duplicate the handle if it can't shimmer, we have to create
+        // a new object anyways.
+
+        // Try to preserve information about filename / line number.
+        var sourceInfo: ?SourceInfo = null;
+        defer if (sourceInfo) |*info| info.deinit(calling_heap.gpa);
+        if (getSourceInfo(handle.*)) |info| {
+            // TODO PERF see if it's possible to not duplicate the filename here
+            sourceInfo = try info.toOwned(calling_heap.gpa);
+        }
+
+        const str = try handle.getString();
+        var parser = Parser.init(str);
+
+        var arena_instance = std.heap.ArenaAllocator.init(calling_heap.gpa);
+        defer arena_instance.deinit();
+        const arena = arena_instance.allocator();
+
+        // Figure out how many tokens there are, so we can create the correct list size
+        // in the heap.
+        var tokens: std.ArrayList(Parser.Token) = .{};
+        while (true) {
+            const next_token = parser.parseList() catch |e| {
+                if (det) |unwrapped| unwrapped.* = try convertParserError(calling_heap, e);
+                return e;
+            };
+            switch (next_token.tag) {
+                .simple_string, .escaped_string, .braced_string => {
+                    try tokens.append(arena, next_token);
+                },
+                .end_of_file => break,
+                else => {},
+            }
+        }
+
+        const new_list = try newUninitializedList(calling_heap, @intCast(tokens.items.len));
+        errdefer calling_heap.release(new_list);
+
+        for (tokens.items, 0..) |token, i| {
+            const item_idx: u32 = @intCast(new_list.index + 1 + i);
+
+            if (token.tag == .simple_string or token.tag == .braced_string) {
+                // Normal string, so no escaping needed.
+                const did_set = try calling_heap.setNormalString(item_idx, str[token.loc.start..token.loc.end]);
+                if (!did_set) {
+                    // Need to duplicate the string, because the heap may take ownership
+                    const token_str = try calling_heap.gpa.allocSentinel(u8, token.loc.end - token.loc.start, 0);
+                    errdefer calling_heap.gpa.free(token_str);
+                    @memcpy(token_str, str[token.loc.start..token.loc.end]);
+
+                    const did_take = try calling_heap.setLongString(item_idx, token_str, .{
+                        .different_capacity = str.len,
+                    });
+                    if (!did_take) calling_heap.gpa.free(token_str);
+                }
+            } else {
+                // Needs escaping. We'll create another string to copy the escaped string into.
+                const escaped_str = try calling_heap.gpa.allocSentinel(u8, token.loc.end - token.loc.start, 0);
+                errdefer calling_heap.gpa.free(escaped_str);
+                const written = stringutil.removeEscaping(str[token.loc.start..token.loc.end], escaped_str);
+                escaped_str[written] = 0; // null terminator
+
+                const did_set = try calling_heap.setNormalString(item_idx, escaped_str[0..written]);
+                if (!did_set) {
+                    // Too large for normal string, so we'll try setting as a long string
+                    const did_take = try calling_heap.setLongString(
+                        item_idx,
+                        escaped_str[0..written :0],
+                        .{ .different_capacity = escaped_str.len },
+                    );
+                    if (!did_take) calling_heap.gpa.free(escaped_str);
+                }
+            }
+        }
+    }
+}
+
+pub fn listElement(calling_heap: *Heap, det: *ErrorDetails, handle: *Handle, index: u32) !?Handle {
+    try shimmerToList(calling_heap, det, handle);
+    const list = handle.peek().body.list;
+
+    if (index < list.len) {
+        return .{
+            .index = handle.index + 1 + index,
+            .heap = handle.heap,
+            .ref_counted = false,
+        };
+    } else return null;
+}
+
+/// Returned slice is stable as long as `list` is not shimmered, and
+/// no elements are inserted.
+pub fn listElements(calling_heap: *Heap, det: ?*ErrorDetails, list: *Handle) ![]Heap.Object {
+    try shimmerToList(calling_heap, det, list);
+
+    const len = list.peek().body.list.len;
+    return list.getHeap().objects.items(.object)[(list.index + 1)..][0..len];
+}
+
+test "Lists" {
+    const ta = testing.allocator;
+    const heap = try Heap.createHeap(ta);
+    defer Heap.deinitAll();
+    var det: ErrorDetails = undefined;
+
+    // Simple case: two objects in a list
+    const obj1 = try newString(heap, "object 1");
+    const obj2 = try newString(heap, "object 2");
+    var list1 = try newList(heap, &.{ obj1, obj2 });
+
+    const elements = try listElements(heap, null, &list1);
+    try testing.expectEqual(2, elements.len);
+    // The object should have been copied when being moved into the lsit
+    try testing.expect(obj1.peek().str != elements[0].str);
+    // But it should have an identical string
+    const elem1 = (try listElement(heap, &det, &list1, 0)).?;
+    try testing.expectEqualStrings(try elem1.getString(), "object 1");
 }
 
 pub const SourceInfo = struct {
     filename_ref: [:0]const u8,
     line_no: u32,
+
+    pub fn toOwned(self: *const SourceInfo, gpa: std.mem.Allocator) !SourceInfo {
+        return .{
+            .filename_ref = try gpa.dupeZ(u8, self.filename_ref),
+            .line_no = self.line_no,
+        };
+    }
+
+    pub fn deinit(self: *SourceInfo, gpa: std.mem.Allocator) void {
+        gpa.free(self.filename_ref);
+    }
 };
 
-pub fn getSourceInfo(obj: Handle) ?SourceInfo {
-    const ref = Heap.peek(obj);
+pub fn getSourceInfo(handle: Handle) ?SourceInfo {
+    const ref = handle.peek();
 
     if (ref.tag != .source) return null;
 
     return .{
-        .filename_ref = Heap.getHeap(obj).getHeapStringZ(ref.body.source.file_name),
+        .filename_ref = handle.getHeap().getHeapStringZ(ref.body.source.file_name),
         .line_no = ref.body.source.line_no,
     };
 }
@@ -633,8 +866,6 @@ pub fn setSourceInfo(calling_heap: *Heap, obj: Handle, file_name: [:0]const u8, 
     for (file_name) |byte| {
         if (byte == 0) return error.EmbeddedNull;
     }
-
-    const ref = Heap.peek(obj);
 
     Heap.invalidateBody(calling_heap, obj);
 
@@ -647,13 +878,14 @@ pub fn setSourceInfo(calling_heap: *Heap, obj: Handle, file_name: [:0]const u8, 
     // Copy the filename
     @memcpy(calling_heap.getHeapString(filename_in_heap, filename_in_heap + len), file_name);
 
+    const ref = obj.peek();
     ref.tag = .source;
     ref.body.source.file_name = filename_in_heap;
     ref.body.source.line_no = line_no;
 }
 
 test "Source info" {
-    const ta = std.testing.allocator;
+    const ta = testing.allocator;
     const heap = try Heap.createHeap(ta);
     defer Heap.deinitAll();
 
@@ -661,38 +893,36 @@ test "Source info" {
     try setSourceInfo(heap, obj, "test_file.tcl", 42);
 
     // Verify the object has the source tag
-    const ref = Heap.peek(obj);
-    try std.testing.expectEqual(.source, ref.tag);
-    try std.testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
+    const ref = obj.peek();
+    try testing.expectEqual(.source, ref.tag);
+    try testing.expectEqual(@as(u32, 42), ref.body.source.line_no);
 
     const info = getSourceInfo(obj);
     if (info) |unwrapped| {
-        try std.testing.expectEqualSlices(u8, "test_file.tcl", unwrapped.filename_ref);
-        try std.testing.expectEqual(@as(u32, 42), unwrapped.line_no);
+        try testing.expectEqualSlices(u8, "test_file.tcl", unwrapped.filename_ref);
+        try testing.expectEqual(@as(u32, 42), unwrapped.line_no);
     } else return error.TestUnexpectedResult;
 
     const obj2 = try newString(heap, "hello");
     const empty_info = getSourceInfo(obj2);
-    try std.testing.expect(empty_info == null);
+    try testing.expect(empty_info == null);
 }
 
 var next_script_id = 1;
 
+////////////////////////////////
+//  Script related functions  //
+
 /// Not threadsafe.
-pub fn shimmerToScript(det: *ErrorDetails, obj: Handle) !void {
+pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, obj: Handle) !void {
     assert(Heap.canShimmer(obj));
 
-    const heap = Heap.getHeap(obj);
     const bytes = try Heap.getString(obj);
     var parser = Parser.init(bytes);
 
     const gpa = Heap.getHeap(obj).gpa;
 
-    // const arena = std.heap.ArenaAllocator.init(gpa);
-    // var scratch = arena.allocator();
-    // defer arena.deinit();
-
-    // Parse all the tokens of the script
+    // Parse all the tokens of the script, handling any errors that come up.
     var tokens = try std.ArrayList(Heap.TokenAndValue).initCapacity(gpa, bytes.len / 8);
     errdefer tokens.deinit(gpa);
 
@@ -704,26 +934,7 @@ pub fn shimmerToScript(det: *ErrorDetails, obj: Handle) !void {
                 else => {},
             }
         } else |err| {
-            switch (err) {
-                error.CharactersAfterCloseBrace => {
-                    det.* = .{ .message = try newString(heap, "extra characters after close-brace") };
-                },
-                error.MissingCloseBrace => {
-                    det.* = .{ .message = try newString(heap, "missing close-brace") };
-                },
-                error.MissingCloseBracket => {
-                    det.* = .{ .message = try newString(heap, "unmatched \"[\"") };
-                },
-                error.MissingCloseQuote => {
-                    det.* = .{ .message = try newString(heap, "missing quote") };
-                },
-                error.TrailingBackslash => {
-                    det.* = .{ .message = try newString(heap, "no character after \\") };
-                },
-                error.OutOfMemory => return err,
-                error.NotVariable => unreachable,
-            }
-
+            if (det) |unwrapped| unwrapped.* = try convertParserError(calling_heap, err);
             if (parser.error_details) |details| {
                 det.index = details.index;
             }
@@ -732,27 +943,33 @@ pub fn shimmerToScript(det: *ErrorDetails, obj: Handle) !void {
     }
 }
 
-pub fn shimmerToBoolean(obj: Handle) !void {
-    assert(Heap.canShimmer(obj));
+pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
+    try Heap.ensureShimmerable(calling_heap, handle);
 
     const Mapping = std.StaticStringMap(bool).initComptime(.{
         .{ "1", true },  .{ "true", true },   .{ "yes", true }, .{ "on", true },
         .{ "0", false }, .{ "false", false }, .{ "no", false }, .{ "off", false },
     });
 
-    const bytes = try Heap.getString(obj);
-    const new_value = Mapping.get(bytes) orelse return error.BadBoolean;
+    const bytes = try handle.getString();
+    const new_value = Mapping.get(bytes) orelse {
+        if (det) |unwrapped| unwrapped.* = .{
+            .message = try newStringFmt(
+                calling_heap,
+                "expected boolean but got \"{f}\"",
+                .{handle},
+            ),
+        };
+        return error.BadBoolean;
+    };
 
-    const ref = Heap.peek(obj);
+    const ref = handle.peek();
     ref.tag = .bool;
     ref.body.bool = new_value;
 }
 
-pub fn getBoolean(calling_heap: *Heap, obj: *Handle) !bool {
-    if (Heap.peek(obj.*).tag != .bool) {
-        try calling_heap.ensureShimmerable(obj);
-        try shimmerToBoolean(obj.*);
-    }
+pub fn getBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !bool {
+    try shimmerToBoolean(calling_heap, det, handle);
 
-    return Heap.peek(obj.*).body.bool;
+    return handle.peek().body.bool;
 }
