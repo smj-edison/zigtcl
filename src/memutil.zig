@@ -59,6 +59,10 @@ pub fn getOrder(count: usize) u6 {
     return @intCast(math.log2_int_ceil(usize, count));
 }
 
+pub fn getOrderSize(order: u6) usize {
+    return @as(usize, 1) << order;
+}
+
 /// Dependant on parent allocator to resize the internal free lists
 pub fn BuddyUnmanaged(max_order: comptime_int) type {
     return struct {
@@ -116,7 +120,7 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
 
             // split blocks (if needed).
             while (open_order > requested_order) : (open_order -= 1) {
-                try self.free_lists[open_order - 1].append(allocator, open_index + get_order_size(open_order - 1));
+                try self.free_lists[open_order - 1].append(allocator, open_index + getOrderSize(open_order - 1));
                 // Lower half is implicitly passed along `open_index`, since
                 // the lower block index stays the same as it descends
             }
@@ -135,7 +139,7 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             self.alloc_count[order] -= 1; // Allocation stats.
 
             // If this block has a buddy, merge. If not, add this block to the appropriate free list.
-            const freed_buddy = buddy_of(index, get_order_size(order));
+            const freed_buddy = buddy_of(index, getOrderSize(order));
             var buddy_free_list_index: usize = undefined;
             for (self.free_lists[order].items, 0..) |block, i| {
                 if (block == freed_buddy) {
@@ -169,7 +173,7 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
                 // for the presence of its buddy in the free list.
 
                 // Search for its buddy.
-                buddy_being_merged = buddy_of(block_being_merged, get_order_size(order_being_merged));
+                buddy_being_merged = buddy_of(block_being_merged, getOrderSize(order_being_merged));
                 for (self.free_lists[order_being_merged].items, 0..) |block, i| {
                     if (block == buddy_being_merged) {
                         buddy_free_list_index = i;
@@ -197,10 +201,6 @@ pub fn BuddyUnmanaged(max_order: comptime_int) type {
             } else {
                 return index - order_size;
             }
-        }
-
-        fn get_order_size(order: u6) usize {
-            return @as(usize, 1) << order;
         }
 
         fn print_buddy_state(self: Self, beginning: []const u8) void {

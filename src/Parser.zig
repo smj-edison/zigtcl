@@ -4,6 +4,7 @@ const std = @import("std");
 const isWhitespace = std.ascii.isWhitespace;
 const isAlphanumeric = std.ascii.isAlphanumeric;
 
+const testing = std.testing;
 const expectEqual = std.testing.expectEqual;
 const expectEqualSlices = std.testing.expectEqualSlices;
 
@@ -22,6 +23,10 @@ in_quote: bool,
 /// Similar to `in_quote`, this keeps track of whether it's possible for the
 /// next token to be a comment (set to true after newline or semicolon).
 comment_possible: bool,
+/// Whether we've emitted {*} for this word yet. There can only be one
+/// argument expansion per word, so the second {*} it sees it'll emit
+/// a .normal_string with the value of "*"
+can_parse_arg_expansion: bool,
 last_token_type: Token.Tag,
 error_details: ?struct { index: u32, line_no: u32 },
 
@@ -51,9 +56,8 @@ pub const Token = struct {
         simple_string,
         /// String that needs escape character conversion
         escaped_string,
-        /// String that was in braces (important to disambiguate between "*" and {*} for
-        /// argument expansion)
-        braced_string,
+        /// "{*}" token
+        argument_expansion,
         /// Variable substitution
         variable_subst,
         /// Syntax sugar for [dict get], $foo(bar)
@@ -69,6 +73,13 @@ pub const Token = struct {
         /// Expression sugar
         expression_sugar,
 
+        /// Special 'start-of-line' token. Corrisponding object contains the
+        /// number of arguments for this command.
+        start_of_line,
+        /// Special 'start-of-word' token. Corrisponding object contains the
+        /// number of tokens to combine for this word (of type .number)
+        start_of_word,
+
         // Used for expr parsing
     };
 };
@@ -80,6 +91,7 @@ pub fn init(buffer: []const u8) Parser {
         .line_no = 1,
         .in_quote = false,
         .comment_possible = true,
+        .can_parse_arg_expansion = false,
         .last_token_type = .none,
         .error_details = null,
     };
@@ -175,10 +187,19 @@ pub fn parseScript(self: *Parser) Error!Token {
 
 pub fn parseString(self: *Parser) !Token {
     switch (self.last_token_type) {
-        .none, .word_separator, .command_separator, .simple_string, .escaped_string => {
-            // This checks if we're at the start of a new word. We need to check because code such as
-            // `hello[world]!` emits three tokens ("hello", "[world]", and "!"). The third token, "!",
-            // would be an example where this branch would not apply.
+        .none, .word_separator, .command_separator, .argument_expansion => {
+            // This branch checks if we're at the start of a new word, or right after argument
+            // expansion.
+
+            // If we're truly at the start of a new word, argument expansion is possible.
+            if (self.last_token_type != .argument_expansion) self.can_parse_arg_expansion = true;
+
+            // We need to check if we're at the start of a new word, because braces
+            // and quotes only have their special sauce apply if they're at the beginning
+            // of a word. For example `foo[bar]baz` emits three tokens ("foo", "[bar]", "baz").
+            // Only "foo" counts as the start of a word.
+            //
+            // One more example, `{can have spaces}[separator]{nospaces this_is_a_new_word`.
             switch (self.current()) {
                 '{' => return self.parseBrace(),
                 '"' => {
@@ -216,34 +237,6 @@ pub fn parseString(self: *Parser) !Token {
 
                 self.advance(1);
             },
-            '(' => {
-                self.advance(1);
-                if (self.current() == '$') {
-                    // this is for a rather obscure case, but you can do the
-                    // following script: ```
-                    // set x {key value}
-                    // set y key
-                    // set z $x($y)
-                    // ```
-                    // Essentially, because we encountered a $, we need to
-                    // cap the current string.
-                    token.tag = .escaped_string;
-                    token.loc.end = self.index;
-                    return token;
-                }
-            },
-            ')' => {
-                self.advance(1);
-                // This branch is similar to the one above, only this is for
-                // emitting the closing ) token.
-
-                // Only need a separate ')' token if the previous token was a var
-                if (self.last_token_type == .variable_subst) {
-                    token.tag = .escaped_string;
-                    token.loc.end = self.index;
-                    return token;
-                }
-            },
             '$', '[' => {
                 // Start of variable/command substitution, so cap this token.
                 token.loc.end = self.index;
@@ -272,7 +265,6 @@ pub fn parseString(self: *Parser) !Token {
         return Error.MissingCloseQuote;
     } else {
         token.loc.end = self.index;
-        token.tag = .escaped_string;
         return token;
     }
 }
@@ -487,11 +479,12 @@ pub fn parseCommand(self: *Parser) Error!Token {
             ']' => {
                 bracket_level -= 1;
                 if (bracket_level == 0) {
+                    token.tag = .command_subst;
+                    token.loc.end = self.index;
+
                     // make sure to advance past the closing bracket
                     self.advance(1);
 
-                    token.tag = .command_subst;
-                    token.loc.end = self.index;
                     return token;
                 }
             },
@@ -503,8 +496,15 @@ pub fn parseCommand(self: *Parser) Error!Token {
                 }
             },
             '{' => {
-                // advance to just past where the brace ends
+                // Mark arg expansion...
+                const could_parse_arg_expansion = self.can_parse_arg_expansion;
+                self.can_parse_arg_expansion = true;
+
+                // Advance to just past where the brace ends.
                 _ = try self.parseBrace();
+
+                //  ...and restore.
+                self.can_parse_arg_expansion = could_parse_arg_expansion;
                 start_of_word = false; // have to set because of the continue
                 continue;
             },
@@ -537,7 +537,7 @@ pub fn parseBrace(self: *Parser) !Token {
     var brace_depth: usize = 1;
 
     var token = self.newToken();
-    token.tag = .braced_string;
+    token.tag = .simple_string;
 
     while (!self.atEnd()) : (self.advance(1)) {
         switch (self.current()) {
@@ -549,6 +549,21 @@ pub fn parseBrace(self: *Parser) !Token {
 
                 if (brace_depth == 0) {
                     token.loc.end = self.index;
+
+                    // Special case: is this argument expansion?
+                    if (self.can_parse_arg_expansion and
+                        token.loc.end - token.loc.start == 1 and
+                        self.buffer[token.loc.start] == '*')
+                    {
+                        // We can't have argument expansion more than once.
+                        self.can_parse_arg_expansion = false;
+                        token.tag = .argument_expansion;
+                        // Make sure to point at after the closing brace.
+                        self.advance(1);
+                        // Note that this returns early, since we don't want to return
+                        // Error.CharactersAfterCloseBrace for argument expansion.
+                        return token;
+                    }
 
                     // We've found the same number of opening and closing braces
                     // at this point. We'll just double-check that there's nothing
@@ -583,7 +598,7 @@ pub fn parseBrace(self: *Parser) !Token {
     return Error.MissingCloseBrace;
 }
 
-/// Parse until the end of the line.
+/// Parse the end of the line until the next command.
 pub fn parseEol(self: *Parser) Token {
     var token = self.newToken();
 
@@ -641,6 +656,9 @@ pub fn parseComment(self: *Parser) !void {
 }
 
 pub fn parseList(self: *Parser) !Token {
+    // Lists are data, not code, so there is no argument expansion.
+    self.can_parse_arg_expansion = false;
+
     if (self.atEnd()) {
         return .{
             .tag = .end_of_file,
@@ -764,6 +782,7 @@ const Mark = struct {
     in_quote: bool,
     comment_possible: bool,
     last_token_type: Token.Tag,
+    can_parse_arg_expansion: bool,
 };
 
 pub fn mark(self: *Parser) Mark {
@@ -773,15 +792,17 @@ pub fn mark(self: *Parser) Mark {
         .in_quote = self.in_quote,
         .comment_possible = self.comment_possible,
         .last_token_type = self.last_token_type,
+        .can_parse_arg_expansion = self.can_parse_arg_expansion,
     };
 }
 
-pub fn restore(self: *Parser, mark_loc: Mark) void {
-    self.index = mark_loc.index;
-    self.line_no = mark_loc.line_no;
-    self.in_quote = mark_loc.in_quote;
-    self.comment_possible = mark_loc.comment_possible;
-    self.last_token_type = mark_loc.last_token_type;
+pub fn restore(self: *Parser, to_restore: Mark) void {
+    self.index = to_restore.index;
+    self.line_no = to_restore.line_no;
+    self.in_quote = to_restore.in_quote;
+    self.comment_possible = to_restore.comment_possible;
+    self.last_token_type = to_restore.last_token_type;
+    self.can_parse_arg_expansion = to_restore.can_parse_arg_expansion;
 }
 
 pub fn current(self: *Parser) u8 {
@@ -824,6 +845,7 @@ test "Parser" {
     const script =
         \\set x 5
         \\set y {a b c}
+        \\set $i $x$y [foo]BAR
     ;
 
     var parser = Parser.init(script);
@@ -839,9 +861,41 @@ test "Parser" {
     try testNextToken(&parser, .word_separator, " ");
     try testNextToken(&parser, .simple_string, "y");
     try testNextToken(&parser, .word_separator, " ");
-    try testNextToken(&parser, .braced_string, "a b c");
+    try testNextToken(&parser, .simple_string, "a b c");
+    try testNextToken(&parser, .command_separator, "\n");
+
+    try testNextToken(&parser, .simple_string, "set");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .variable_subst, "i");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .variable_subst, "x");
+    try testNextToken(&parser, .variable_subst, "y");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .command_subst, "foo");
+    try testNextToken(&parser, .simple_string, "BAR");
 
     try testNextToken(&parser, .end_of_file, "");
+
+    const broken = "set x {good}bad";
+    parser = Parser.init(broken);
+
+    try testNextToken(&parser, .simple_string, "set");
+    try testNextToken(&parser, .word_separator, " ");
+    try testNextToken(&parser, .simple_string, "x");
+    try testNextToken(&parser, .word_separator, " ");
+    try testing.expectError(error.CharactersAfterCloseBrace, parser.parseScript());
+
+    // const argument_expansion = "{*}$value";
+    // parser = Parser.init(argument_expansion);
+
+    // try testNextToken(&parser, .argument_expansion, "*");
+    // try testNextToken(&parser, .variable_subst, "value");
+
+    const double_asterisks = "{*}{*}";
+    parser = Parser.init(double_asterisks);
+
+    try testNextToken(&parser, .argument_expansion, "*");
+    try testNextToken(&parser, .simple_string, "*");
 }
 
 fn testNextToken(parser: *Parser, expected_type: Token.Tag, expected_value: []const u8) !void {

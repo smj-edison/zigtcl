@@ -96,7 +96,76 @@ pub const CustomTypeInstance = struct {
     second_ptr: *anyopaque,
 };
 
-/// Local to the interpreter. Not threadsafe.
+/// This is the script object internal representation. It is an array
+/// of Parser.Tokens alongside a heap-stored list for all tokens' values.
+///
+/// For example the script:
+///
+/// puts hello
+/// set $i $x$y [foo]BAR
+///
+/// will produce a ParsedScript with the following token/object pairs:
+///
+/// | .start_of_line  | 2     |
+/// | .simple_string  | puts  |
+/// | .simple_string  | hello |
+/// | .start_of_line  | 4     |
+/// | .simple_string  | set   |
+/// | .variable_subst | i     |
+/// | .start_of_word  | 2     |
+/// | .variable_subst | x     |
+/// | .variable_subst | y     |
+/// | .start_of_word  | 2     |
+/// | .command_subst  | foo   |
+/// | .simple_string  | BAR   |
+///
+/// "puts hello" has two args (.start_of_line 2), composed of single tokens.
+/// (Note that the .start_of_line token is omitted for the common case of a
+/// single token.)
+///
+/// "set $i $x$y [foo]BAR" has four (.start_of_line 4) args, the first word
+/// has 1 token (.simple_string set), and the last has two tokens
+/// (.start_of_word 2 .command_subst foo .simple_string BAR)
+///
+/// The precomputation of the command structure makes eval() faster,
+/// and simpler because there aren't dynamic lengths / allocations.
+///
+/// -- {*} handling --
+///
+/// Expand is handled in a special way.
+///
+///   If a "word" begins with {*}, the corrisponding object type is ".none".
+///
+/// For example the command:
+///
+/// list {*}{a b}
+///
+/// Will produce the following pairs:
+///
+/// | .start_of_line | 2     |
+/// | .simple_string | list  |
+/// | .start_of_word | .none |
+/// | .braced_string | a b   |
+///
+/// Note that the '.start_of_line' token also contains the source information
+/// for the first word of the line for error reporting purposes
+///
+/// -- the substFlags field of the structure --
+///
+/// The scriptObj structure is used to represent both "script" objects
+/// and "subst" objects. In the second case, there are no LIN and WRD
+/// tokens. Instead SEP and EOL tokens are added as-is.
+/// In addition, the field 'substFlags' is used to represent the flags used to turn
+/// the string into the internal representation.
+/// If these flags do not match what the application requires,
+/// the scriptObj is created again. For example the script:
+///
+/// subst -nocommands $string
+/// subst -novariables $string
+///
+/// Will (re)create the internal representation of the $string object
+/// two times.
+///
 const ParsedScript = struct {
     /// A handle pointing to a tcl list that has the same length as `tokens`,
     /// that stores the state of the evaluated script. Note, this is not
@@ -158,9 +227,10 @@ pub const Tag = enum(u5) {
     float,
     bool,
     string,
+    source,
     list,
     dict,
-    source,
+    script_line,
     script,
     reference,
     custom_type,
@@ -225,6 +295,7 @@ pub const ScriptId = enum(u64) {
 };
 
 pub const Body = packed union {
+    none: void,
     /// List index
     index: ListIndex,
     number: i64,
@@ -244,6 +315,15 @@ pub const Body = packed union {
     list: packed struct {
         len: u32,
     },
+    /// Items of the dictionary are stored directly after, similar to a list.
+    /// Keys and values alternate. Allows for duplicate keys when shimmering
+    /// from a list, but duplicates will be removed when any writing operation
+    /// happens.
+    dict: DictIndex,
+    script_line: packed struct {
+        line: u32,
+        arg_count: u32,
+    },
     script: packed struct {
         id: ScriptId,
     },
@@ -252,15 +332,19 @@ pub const Body = packed union {
         type_id: u32,
         index: u32,
     },
-    /// Items of the dictionary are stored directly after, similar to a list.
-    /// Keys and values alternate. Allows for duplicate keys when shimmering
-    /// from a list, but duplicates will be removed when any writing operation
-    /// happens.
-    dict: DictIndex,
 };
 
 comptime {
     assert(@sizeOf(Body) == 8);
+
+    // Make sure Tag and Body have the same fields
+    const tag_fields = @typeInfo(Tag).@"enum".fields;
+    const body_fields = @typeInfo(Body).@"union".fields;
+
+    assert(tag_fields.len == body_fields.len);
+    for (tag_fields, body_fields) |tag_field, body_field| {
+        assert(std.mem.eql(u8, tag_field.name, body_field.name));
+    }
 }
 
 pub const CustomType = struct {
@@ -299,6 +383,11 @@ pub const Handle = packed struct(u64) {
     pub fn canShimmer(handle: Handle) bool {
         // Can't shimmer if it's shared between threads
         return !handle.getHeap().objects.get(handle.index).metadata.cross_thread;
+    }
+
+    pub fn isShared(handle: Handle) bool {
+        const objects = handle.getHeap().objects.slice();
+        return objects.items(.metadata)[handle.index].cross_thread or objects.items(.ref_count)[handle.index] > 1;
     }
 
     pub fn reference(handle: Handle) Object {
@@ -554,7 +643,41 @@ pub fn createObjects(self: *Heap, count: u32) !u32 {
     return index;
 }
 
-fn freeObject(calling_heap: *Heap, handle: Handle) void {
+/// Does not run any destructors, frees the object directly.
+pub fn freeObjectBacking(calling_heap: *Heap, handle: Handle) void {
+    const obj_heap = handle.getHeap();
+    const metadata = obj_heap.objects.items(.metadata)[handle.index];
+
+    obj_heap.mem_mgmt_mutex.lock();
+    if (cfg.trace_mem) {
+        const trace = &obj_heap.objects.items(.trace)[handle.index];
+        trace.addAddr(@returnAddress(), std.fmt.allocPrint(
+            calling_heap.gpa,
+            "Free {} of order {}",
+            .{ handle.index, metadata.order },
+        ) catch "OOM");
+
+        if (!metadata.in_use) {
+            trace.dump();
+            @panic("Double free!");
+        }
+    }
+
+    obj_heap.object_tracking.free(handle.index, metadata.order);
+
+    // Mark as free in metadata.
+    const alloc_size = memutil.getOrderSize(metadata.order);
+    @memset(obj_heap.objects.items(.metadata)[handle.index..][0..alloc_size], .{
+        .order = 31,
+        .is_alloc_head = false,
+        .cross_thread = false,
+        .in_use = false,
+    });
+
+    obj_heap.mem_mgmt_mutex.unlock();
+}
+
+pub fn freeObject(calling_heap: *Heap, handle: Handle) void {
     const obj_heap = handle.getHeap();
 
     calling_heap.invalidateBody(handle);
@@ -562,26 +685,9 @@ fn freeObject(calling_heap: *Heap, handle: Handle) void {
 
     const metadata = obj_heap.objects.items(.metadata)[handle.index];
     if (metadata.is_alloc_head) {
-        obj_heap.mem_mgmt_mutex.lock();
-        if (cfg.trace_mem) {
-            const trace = &calling_heap.objects.items(.trace)[handle.index];
-            trace.addAddr(@returnAddress(), std.fmt.allocPrint(
-                calling_heap.gpa,
-                "Free {} of order {}",
-                .{ handle.index, metadata.order },
-            ) catch "OOM");
+        if (!metadata.in_use) @panic("Double free!");
 
-            if (!metadata.in_use) {
-                trace.dump();
-                @panic("Double free!");
-            }
-        } else if (!metadata.in_use) {
-            @panic("Double free!");
-        }
-
-        obj_heap.object_tracking.free(handle.index, metadata.order);
-        obj_heap.objects.items(.metadata)[handle.index].in_use = false;
-        obj_heap.mem_mgmt_mutex.unlock();
+        freeObjectBacking(calling_heap, handle);
     }
 }
 
@@ -683,7 +789,7 @@ pub fn invalidateBody(calling_heap: *Heap, handle: Handle) void {
             const file_name = obj_heap.getHeapStringZ(source.file_name);
             obj_heap.freeString(source.file_name, @intCast(file_name.len));
         },
-        .none, .index, .number, .float, .bool => {},
+        .none, .index, .number, .float, .bool, .script_line => {},
     }
 
     obj.tag = .none;
@@ -801,11 +907,23 @@ fn duplicateObjString(calling_heap: *Heap, handle: Handle) !Object.StrOrPtr {
     }
 }
 
+/// Duplicates the object if it's a single item, otherwise create a reference to it.
+pub fn duplicateOrReference(self: *Heap, handle: Handle) !Object {
+    return Heap.duplicateSingle(self, handle) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MultiItemObject => {
+            // This item can't be duplicated, as it contains multiple objects.
+            // We'll create a reference to it instead.
+            return handle.reference();
+        },
+    };
+}
+
 /// If called with a multi-item object, will return error.MultiItemObject
 pub fn duplicateSingle(self: *Heap, handle: Handle) error{ OutOfMemory, MultiItemObject }!Object {
     const src = handle.peek();
     switch (src.tag) {
-        .none, .index, .number, .float, .string, .bool, .script => {
+        .none, .index, .number, .float, .string, .bool, .script, .script_line => {
             return .{
                 .str = try self.duplicateObjString(handle),
                 .tag = src.tag,
@@ -1181,6 +1299,9 @@ fn getLocalString(self: *Heap, index: u32) error{OutOfMemory}![:0]const u8 {
             // Intentionally return early, since we should always use
             // the reference's string, not our own
             return obj.body.reference.getString();
+        },
+        .script_line => {
+            @panic("Script line is an internal object only");
         },
         .source, .script => {
             @panic("Source and script objects should always have a string representation");

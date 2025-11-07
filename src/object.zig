@@ -5,6 +5,7 @@ const testing = std.testing;
 
 const options = @import("options");
 const stringutil = @import("./stringutil.zig");
+const memutil = @import("./memutil.zig");
 const Heap = @import("./Heap.zig");
 const Parser = @import("./Parser.zig");
 const Handle = Heap.Handle;
@@ -174,7 +175,7 @@ pub fn constrainRange(list_len: usize, range: Range) ?Range {
 
 /// Sets the details to a bad index message, and returns error.BadIndex.
 fn badIndex(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
-    if (det) |unwrapped| unwrapped.* = .{
+    if (det) |details| details.* = .{
         .message = try newStringFmt(calling_heap, "bad index \"{f}\": must be intexpr or end?[+-]intexpr?", .{handle}),
     };
 
@@ -530,7 +531,7 @@ pub fn TclEnum(comptime T: type, enum_name: []const u8) type {
             if (variant) |unwrapped| {
                 return unwrapped;
             } else {
-                if (det) |unwrapped| unwrapped.* = .{
+                if (det) |details| details.* = .{
                     .message = try newStringFmt(
                         calling_heap,
                         "bad {s} \"{f}\": must be {s}",
@@ -667,22 +668,14 @@ pub fn newUninitializedList(heap: *Heap, len: u32) !Handle {
     return heap.normalHandle(list_index);
 }
 
-pub fn newList(heap: *Heap, elements: []const Handle) !Handle {
-    const list = try newUninitializedList(heap, @intCast(elements.len));
+pub fn newList(heap: *Heap, handles: []const Handle) !Handle {
+    const list = try newUninitializedList(heap, @intCast(handles.len));
     errdefer heap.release(list);
 
-    const items = heap.objects.items(.object)[(list.index + 1)..][0..elements.len];
+    const new_items = listItemsRaw(list);
 
-    for (elements, items) |element, *item| {
-        item.* = Heap.duplicateSingle(heap, element) catch |e| switch (e) {
-            error.OutOfMemory => return e,
-            error.MultiItemObject => {
-                // This item can't be duplicated, as it contains multiple objects.
-                // We'll create a reference to it instead.
-                item.* = element.reference();
-                continue;
-            },
-        };
+    for (handles, new_items) |handle, *item| {
+        item.* = try heap.duplicateOrReference(handle);
     }
 
     return list;
@@ -723,7 +716,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         defer if (sourceInfo) |*info| info.deinit(calling_heap.gpa);
         if (getSourceInfo(handle.*)) |info| {
             // TODO PERF see if it's possible to not duplicate the filename here
-            sourceInfo = try info.toOwned(calling_heap.gpa);
+            sourceInfo = try info.duplicate(calling_heap.gpa);
         }
 
         const str = try handle.getString();
@@ -738,15 +731,17 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         var tokens: std.ArrayList(Parser.Token) = .{};
         while (true) {
             const next_token = parser.parseList() catch |e| {
-                if (det) |unwrapped| unwrapped.* = try convertParserError(calling_heap, e);
+                if (det) |details| details.* = try convertParserError(calling_heap, e);
                 return e;
             };
             switch (next_token.tag) {
-                .simple_string, .escaped_string, .braced_string => {
+                .simple_string, .escaped_string => {
                     try tokens.append(arena, next_token);
                 },
                 .end_of_file => break,
-                else => {},
+                else => {
+                    // Skip any line breaks or word breaks.
+                },
             }
         }
 
@@ -756,7 +751,7 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
         for (tokens.items, 0..) |token, i| {
             const item_idx: u32 = @intCast(new_list.index + 1 + i);
 
-            if (token.tag == .simple_string or token.tag == .braced_string) {
+            if (token.tag == .simple_string) {
                 // Normal string, so no escaping needed.
                 const did_set = try calling_heap.setNormalString(item_idx, str[token.loc.start..token.loc.end]);
                 if (!did_set) {
@@ -789,29 +784,100 @@ pub fn shimmerToList(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) 
                 }
             }
         }
+
+        const old_handle = handle.*;
+        handle.* = new_list;
+        calling_heap.release(old_handle);
     }
 }
 
-pub fn listElement(calling_heap: *Heap, det: *ErrorDetails, handle: *Handle, index: u32) !?Handle {
-    try shimmerToList(calling_heap, det, handle);
-    const list = handle.peek().body.list;
+/// Panics if provided handle is not a list.
+fn listSetLength(calling_heap: *Heap, handle: *Handle, new_len: u32) !void {
+    const list = handle.*.peek();
+    assert(list.tag == .list);
 
-    if (index < list.len) {
+    // No need to resize if there's enough space.
+    if (new_len <= list.body.list.len) {
+        list.body.list.len = new_len;
+        return;
+    }
+
+    // Even if there's not enough length, there may be enough capacity.
+    const order = handle.getHeap().objects.items(.metadata)[handle.index].order;
+    const capacity = memutil.getOrderSize(order) - 1; // -1 for list head
+    if (new_len <= capacity) {
+        list.body.list.len = new_len;
+    }
+
+    // We've exhausted all other options, so we'll need to make a new list.
+    const new_list = try newUninitializedList(calling_heap, new_len);
+    errdefer calling_heap.freeObject(new_list);
+    const new_items = listItemsRaw(new_list);
+
+    if (handle.isShared()) {
+        // If the list is shared, we need to duplicate all the items.
+        for (0.., new_items) |i, *new_item| {
+            new_item.* = try Heap.duplicateOrReference(calling_heap, listItemRaw(handle.*, @intCast(i)));
+        }
+
+        const old_handle = handle.*;
+        handle.* = new_list;
+        calling_heap.release(old_handle);
+    } else {
+        // If the list isn't shared, we can copy over the objects over without
+        // any duplication.
+        const old_items = listItemsRaw(handle.*);
+        for (old_items, new_items) |old_item, *new_item| {
+            new_item.* = old_item;
+        }
+
+        // Free the old list without running destructors (because the objects are
+        // still in use).
+        handle.getHeap().freeObjectBacking(handle.*);
+
+        handle.* = new_list;
+    }
+}
+
+/// Assumes provided handle is a list.
+fn listItemRaw(handle: Handle, index: u32) Handle {
+    const list = handle.peek();
+    assert(list.tag == .list);
+
+    if (index < list.body.list.len) {
         return .{
             .index = handle.index + 1 + index,
             .heap = handle.heap,
             .ref_counted = false,
         };
+    } else @panic("List element out of bounds");
+}
+
+pub fn listItem(calling_heap: *Heap, det: *ErrorDetails, handle: *Handle, index: u32) !?Handle {
+    try shimmerToList(calling_heap, det, handle);
+    const list = handle.peek().body.list;
+
+    if (index < list.len) {
+        return listItemRaw(handle.*, index);
     } else return null;
 }
 
-/// Returned slice is stable as long as `list` is not shimmered, and
-/// no elements are inserted.
-pub fn listElements(calling_heap: *Heap, det: ?*ErrorDetails, list: *Handle) ![]Heap.Object {
-    try shimmerToList(calling_heap, det, list);
+/// Assumes handle is a list.
+fn listItemsRaw(handle: Handle) []Heap.Object {
+    const list = handle.peek();
+    assert(list.tag == .list);
 
-    const len = list.peek().body.list.len;
-    return list.getHeap().objects.items(.object)[(list.index + 1)..][0..len];
+    return handle.getHeap().objects.items(.object)[(handle.index + 1)..][0..list.body.list.len];
+}
+
+pub fn listAppend(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle, item: Handle) !void {
+    try shimmerToList(calling_heap, det, handle);
+    try listSetLength(calling_heap, handle, handle.peek().body.list.len + 1);
+
+    const list = handle.peek();
+    const index = list.body.list.len - 1;
+
+    listItemsRaw(handle.*)[index] = try calling_heap.duplicateOrReference(item);
 }
 
 test "Lists" {
@@ -825,20 +891,33 @@ test "Lists" {
     const obj2 = try newString(heap, "object 2");
     var list1 = try newList(heap, &.{ obj1, obj2 });
 
-    const elements = try listElements(heap, null, &list1);
-    try testing.expectEqual(2, elements.len);
-    // The object should have been copied when being moved into the lsit
-    try testing.expect(obj1.peek().str != elements[0].str);
+    const items = listItemsRaw(list1);
+    try testing.expectEqual(2, items.len);
+    // The object should have been copied when being moved into the list
+    try testing.expect(obj1.peek().str != items[0].str);
     // But it should have an identical string
-    const elem1 = (try listElement(heap, &det, &list1, 0)).?;
-    try testing.expectEqualStrings(try elem1.getString(), "object 1");
+    try testing.expectEqualStrings("object 1", try listItemRaw(list1, 0).getString());
+
+    const to_append = try newString(heap, "appended item");
+    try listAppend(heap, &det, &list1, to_append);
+    try testing.expectEqualStrings("appended item", try listItemRaw(list1, 2).getString());
+
+    var string_list = try newString(heap,
+        \\item1 {item 2} item\ 3
+    );
+    // const old_string_list_handle = string_list;
+    try shimmerToList(heap, &det, &string_list);
+    // try testing.expect(old_string_list_handle != string_list);
+    // try testing.expectEqualStrings("item1", try listItemRaw(string_list, 0).getString());
+    // try testing.expectEqualStrings("item 2", try listItemRaw(string_list, 1).getString());
+    // try testing.expectEqualStrings("item 3", try listItemRaw(string_list, 2).getString());
 }
 
 pub const SourceInfo = struct {
     filename_ref: [:0]const u8,
     line_no: u32,
 
-    pub fn toOwned(self: *const SourceInfo, gpa: std.mem.Allocator) !SourceInfo {
+    pub fn duplicate(self: *const SourceInfo, gpa: std.mem.Allocator) !SourceInfo {
         return .{
             .filename_ref = try gpa.dupeZ(u8, self.filename_ref),
             .line_no = self.line_no,
@@ -914,33 +993,97 @@ var next_script_id = 1;
 //  Script related functions  //
 
 /// Not threadsafe.
-pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, obj: Handle) !void {
-    assert(Heap.canShimmer(obj));
+pub fn shimmerToScript(calling_heap: *Heap, det: ?*ErrorDetails, handle: Handle) !void {
+    try Heap.ensureShimmerable(calling_heap, handle);
 
-    const bytes = try Heap.getString(obj);
+    const bytes = try handle.getString();
     var parser = Parser.init(bytes);
 
-    const gpa = Heap.getHeap(obj).gpa;
-
     // Parse all the tokens of the script, handling any errors that come up.
-    var tokens = try std.ArrayList(Heap.TokenAndValue).initCapacity(gpa, bytes.len / 8);
-    errdefer tokens.deinit(gpa);
 
+    // Set up tokens list.
+    var tokens = try std.ArrayList(Parser.Token.Tag).initCapacity(calling_heap.gpa, bytes.len / 8);
+    errdefer tokens.deinit(calling_heap.gpa);
+
+    // Track how many commands there are, so we can be sure to make a .start_of_line for
+    // each of them.
+    var command_count: usize = 1;
+    // Also track how many words there are that have multiple components (i.e. something like `foo$bar`)
+    // so we have enough space for all needed ".start_of_word"s.
+    var multi_word_count: usize = 0;
+    // Count how many sections are within this word ("foo", 1 section, "foo$bar", 2 sections, etc).
+    var word_section_count: usize = 0;
+    // How many separators were found (we'll subtract one from the total for each separator).
+    var separator_count: usize = 0;
+    // Used for trimming the first whitespace, if any.
+    var is_first_token: bool = true;
+    // Add all tokens to the list, handling any errors that may come up.
     while (true) {
         const next_token = parser.parseScript();
         if (next_token) |token| {
+            tokens.append(calling_heap.gpa, token);
             switch (token.tag) {
+                .word_separator => {
+                    separator_count += 1;
+                    word_section_count = 0;
+                },
+                .command_separator => {
+                    separator_count += 1;
+                    // Make sure we don't double-count the first command.
+                    if (!is_first_token) command_count += 1;
+                },
+                .argument_expansion => {
+                    // Argument expansion is always considered a multi word, though
+                    // it inserts an .argument_expansion token instead of a .start_or_word
+                    // token.
+                    multi_word_count += 1;
+                    word_section_count = 0;
+                },
+                .simple_string, .escaped_string, .variable_subst, .dict_sugar, .command_subst => {
+                    word_section_count += 1;
+                    // Why exactly 2? Because otherwise multi_word_count would increment for every
+                    // section of a multi word.
+                    if (word_section_count == 2) multi_word_count += 1;
+                },
                 .end_of_file => break,
-                else => {},
             }
         } else |err| {
-            if (det) |unwrapped| unwrapped.* = try convertParserError(calling_heap, err);
-            if (parser.error_details) |details| {
-                det.index = details.index;
+            if (det) |details| {
+                details.* = try convertParserError(calling_heap, err);
+                if (parser.error_details) |parser_details| {
+                    details.index = parser_details.index;
+                }
             }
             return err;
         }
+
+        is_first_token = false;
     }
+
+    const new_token_count = tokens.len + command_count + multi_word_count - separator_count;
+
+    // Initialize the Heap-stored list that will store all the corrisponding value for each token
+    const token_values = try newUninitializedList(calling_heap, new_token_count);
+    errdefer calling_heap.release(token_values);
+    const converted_tokens = try calling_heap.gpa.alloc(Parser.Token.Tag, new_token_count);
+    errdefer calling_heap.gpa.free(converted_tokens);
+    // const elements = listElements(calling_heap, null, token_values) catch unreachable;
+
+    // // The initial command separator was trimmed, if it existed in the first place,
+    // // so we'll start off with it.
+    // var token: Parser.Token.Tag = .command_separator;
+    // // Where the command started (the start_of_line token), so we can edit its information
+    // // when we reach the end of the command.
+    // var command_start: usize = 0;
+    // var i: usize = 0;
+
+    // while (i < )
+    // for (tokens.items, 0..) |token, i| {
+    //     if (token[i] == .command_separator) {
+    //         converted_tokens[i] = .start_of_line;
+    //         elements[i].tag = .script_line;
+    //     }
+    // }
 }
 
 pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handle) !void {
@@ -953,7 +1096,7 @@ pub fn shimmerToBoolean(calling_heap: *Heap, det: ?*ErrorDetails, handle: *Handl
 
     const bytes = try handle.getString();
     const new_value = Mapping.get(bytes) orelse {
-        if (det) |unwrapped| unwrapped.* = .{
+        if (det) |details| details.* = .{
             .message = try newStringFmt(
                 calling_heap,
                 "expected boolean but got \"{f}\"",
